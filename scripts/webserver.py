@@ -35,6 +35,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import brandmeister
 import flight_lookup
 import pass_predict
+import shortwave_id
 from presets import PRESETS, GROUPS, CATEGORY_LABELS, DMR_REPEATERS, SPECTRUM_RANGES
 from satellites import SATELLITES
 
@@ -546,6 +547,10 @@ INDEX_HTML = """<!doctype html>
 <section>
   <h2>Status: <span id="status-pill" class="status-pill idle">idle</span></h2>
   <p id="status-detail" class="hint"></p>
+  <div id="shortwave-id-box" style="display:none">
+    <button id="shortwave-id-btn" onclick="identifyShortwave('shortwave-id-results')" style="font-size:0.8rem">Identify shortwave station</button>
+    <div id="shortwave-id-results" class="hint"></div>
+  </div>
   <div class="row">
     <div>
       <label for="category">Band</label>
@@ -765,6 +770,10 @@ INDEX_HTML = """<!doctype html>
     Sweep paused while tuned in -- waterfall is showing the last frame from before the click.
     <button id="spectrum-resume-btn" onclick="resumeSpectrumSweep()">Resume sweep</button>
   </div>
+  <div id="spectrum-shortwave-id-box" style="display:none">
+    <button id="spectrum-shortwave-id-btn" onclick="identifyShortwave('spectrum-shortwave-id-results')" style="font-size:0.8rem">Identify shortwave station</button>
+    <div id="spectrum-shortwave-id-results" class="hint"></div>
+  </div>
   <div id="wf-wrap" style="position:relative">
     <canvas id="spectrum-waterfall" width="900" height="260"
       style="width:100%;height:260px;background:#000;border-radius:4px;image-rendering:pixelated;display:block"></canvas>
@@ -847,6 +856,7 @@ async function refreshStatus() {
   const pill = document.getElementById('status-pill');
   const detail = document.getElementById('status-detail');
   const isSpectrum = s.running && s.kind === 'spectrum';
+  const isShortwaveAm = s.running && s.kind === 'record' && s.mode === 'am' && s.freq_hz != null && s.freq_hz < 30e6;
   pill.textContent = s.running ? 'running' : 'idle';
   pill.className = 'status-pill ' + (s.running ? 'running' : 'idle');
   document.getElementById('start-btn').disabled = s.running;
@@ -869,6 +879,7 @@ async function refreshStatus() {
   } else {
     detail.textContent = s.returncode !== null && s.returncode !== undefined ? `last exit code: ${s.returncode}` : 'not running';
   }
+  document.getElementById('shortwave-id-box').style.display = isShortwaveAm ? 'block' : 'none';
 
   const isTuned = s.running && s.kind === 'record' && s.prefix === 'SPEC_TUNE';
   const spPill = document.getElementById('spectrum-status-pill');
@@ -880,6 +891,38 @@ async function refreshStatus() {
   spDetail.textContent = (isSpectrum || isTuned) ? detail.textContent
     : (s.running ? `SDR is busy with "${s.kind}" -- stop it from the ${s.kind === 'dmr' ? 'Radio' : 'other'} tab first` : '');
   document.getElementById('spectrum-tuned-info').style.display = (isTuned && lastSweepParams) ? 'block' : 'none';
+  document.getElementById('spectrum-shortwave-id-box').style.display = (isTuned && isShortwaveAm) ? 'block' : 'none';
+}
+
+async function identifyShortwave(targetId) {
+  const target = document.getElementById(targetId);
+  const status = await (await fetch('/api/status')).json();
+  if (!status.running || status.mode !== 'am' || status.freq_hz == null) return;
+  target.textContent = 'Looking up (EiBi shortwave schedule)...';
+  const res = await fetch('/api/shortwave-id?freq_hz=' + status.freq_hz);
+  const matches = await res.json();
+  target.innerHTML = '';
+  if (!res.ok) { target.textContent = matches.error || 'lookup failed'; return; }
+  if (!Array.isArray(matches) || matches.length === 0) {
+    target.textContent = 'No scheduled broadcast found for this frequency/time in the EiBi schedule.';
+    return;
+  }
+  const note = document.createElement('div');
+  note.className = 'hint';
+  note.textContent = 'Candidates (schedule match, not a decode -- confirm by ear):';
+  target.appendChild(note);
+  for (const m of matches) {
+    const row = document.createElement('div');
+    const name = document.createElement('span');
+    name.textContent = m.station;
+    const meta = document.createElement('span');
+    meta.className = 'hint';
+    meta.textContent = ` (${m.time} UTC ${m.days || 'daily'} · lang=${m.language} `
+      + `· target=${m.target} · ${m.country}${m.site ? ' · site=' + m.site : ''})`;
+    row.appendChild(name);
+    row.appendChild(meta);
+    target.appendChild(row);
+  }
 }
 
 async function refreshLogs() {
@@ -1692,6 +1735,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_locate(parse_qs(parsed.query))
         elif parsed.path.startswith("/audio/"):
             self._serve_audio(parsed.path[len("/audio/"):])
+        elif parsed.path == "/api/shortwave-id":
+            self._handle_shortwave_id(parse_qs(parsed.query))
         elif parsed.path == "/api/satellite/passes":
             self._handle_satellite_passes(parse_qs(parsed.query))
         elif parsed.path == "/api/satellite/schedule":
@@ -1738,6 +1783,28 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": f"pass prediction failed: {exc}"}, 502)
             return
         self._send_json(passes)
+
+    def _handle_shortwave_id(self, query: dict):
+        """Candidate broadcasters for a shortwave AM frequency right now,
+        via EiBi's published schedule (see shortwave_id.py) -- AM carries no
+        station ID in the signal itself, unlike FM's RDS, so this is a
+        schedule lookup rather than a decode."""
+        freq_vals = query.get("freq_hz")
+        if not freq_vals:
+            self._send_json({"error": "freq_hz is required"}, 400)
+            return
+        try:
+            freq_hz = float(freq_vals[0])
+        except ValueError:
+            self._send_json({"error": "invalid freq_hz"}, 400)
+            return
+        try:
+            schedule = shortwave_id.parse_schedule(shortwave_id.fetch_schedule())
+            matches = shortwave_id.lookup(schedule, freq_hz)
+        except (urllib.error.URLError, OSError, RuntimeError) as exc:
+            self._send_json({"error": f"shortwave lookup failed: {exc}"}, 502)
+            return
+        self._send_json(matches)
 
     def _handle_locate(self, query: dict):
         """Look up the real flight behind an ATC transmission (see
