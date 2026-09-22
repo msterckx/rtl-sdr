@@ -87,6 +87,8 @@ class Recorder:
                 "record": meta.get("record"),
                 "voice_check": meta.get("voice_check"),
                 "antenna": meta.get("antenna"),
+                "listen_audio": meta.get("listen_audio"),
+                "listen_device": meta.get("listen_device"),
                 "started_at": self._started_at.isoformat() if self._started_at else None,
                 "returncode": self._returncode,
             }
@@ -121,7 +123,7 @@ class Recorder:
                 cmd = cmd + ["--no-transcribe"]
 
             proc = subprocess.Popen(
-                cmd, cwd=str(PROJECT_ROOT),
+                cmd, cwd=str(PROJECT_ROOT), env=_pipewire_env(),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
             )
@@ -134,7 +136,8 @@ class Recorder:
             threading.Thread(target=self._reader, args=(proc,), daemon=True).start()
 
     def start(self, freq_hz: float, mode: str, prefix: str, gain: float | None, transcribe: bool,
-              category: str | None = None, antenna: str | None = None):
+              category: str | None = None, antenna: str | None = None,
+              listen_audio: bool = False, listen_device: str | None = None):
         cmd = [
             sys.executable, str(RECORD_SCRIPT),
             "--freq", str(freq_hz),
@@ -144,9 +147,14 @@ class Recorder:
         ]
         if category:
             cmd = cmd + ["--category", category]
+        if listen_audio:
+            cmd = cmd + ["--listen"]
+            if listen_device:
+                cmd = cmd + ["--listen-device", listen_device]
         self._start_process(cmd, gain, transcribe,
                              {"kind": "record", "freq": freq_hz, "mode": mode, "prefix": prefix,
-                              "category": category, "antenna": antenna}, antenna)
+                              "category": category, "antenna": antenna,
+                              "listen_audio": listen_audio, "listen_device": listen_device}, antenna)
 
     def start_scan(self, group: str, gain: float | None, transcribe: bool, antenna: str | None = None):
         cmd = [
@@ -439,6 +447,41 @@ def list_spectrum_hits(limit: int = SPECTRUM_HITS_LIMIT):
     return hits
 
 
+def _pipewire_env() -> dict:
+    """os.environ with XDG_RUNTIME_DIR filled in if missing, so pactl/paplay
+    subprocesses can find this user's PipeWire/PulseAudio session socket
+    (/run/user/<uid>/pulse/native). webserver.py is launched by startup.sh
+    as a plain background process, not from a login/desktop session, so it
+    doesn't inherit XDG_RUNTIME_DIR the way an interactive shell does --
+    without this, pactl/paplay fail with "Connection refused" and silently
+    produce no sinks / no sound, both here and in any record.py child this
+    process spawns with --listen."""
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return env
+
+
+def list_audio_sinks():
+    """Local playback sinks (`pactl list sinks short`), for the Radio tab's
+    "Listen live" device picker -- lets the UI offer real sink names (a
+    plugged-in USB/Bluetooth headset, an HDMI output, ...) instead of the
+    user having to find and type one by hand. Excludes wsjtx_in: it's a
+    null sink for feeding WSJT-X (see wsjtx_audio_setup.sh), picking it here
+    would silently produce no audible sound, which is the exact footgun
+    --listen-device exists to let the user avoid."""
+    try:
+        result = subprocess.run(["pactl", "list", "sinks", "short"],
+                                 capture_output=True, text=True, timeout=5, env=_pipewire_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    sinks = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) >= 2 and fields[1] != "wsjtx_in":
+            sinks.append({"name": fields[1], "state": fields[4] if len(fields) > 4 else None})
+    return sinks
+
+
 def read_spectrum_waterfall():
     if not SPECTRUM_WATERFALL_PATH.is_file():
         return None
@@ -548,6 +591,13 @@ INDEX_HTML = """<!doctype html>
     </div>
     <div>
       <label><input type="checkbox" id="transcribe" checked> transcribe</label>
+    </div>
+    <div>
+      <label><input type="checkbox" id="listen" onchange="document.getElementById('listen-device-field').style.display = this.checked ? '' : 'none'"> listen live</label>
+    </div>
+    <div id="listen-device-field" style="display:none">
+      <label for="listen-device">Play through</label>
+      <select id="listen-device"></select>
     </div>
     <div>
       <button class="primary" id="start-btn" onclick="startRecording()">Start</button>
@@ -781,6 +831,7 @@ async function refreshStatus() {
   document.getElementById('stop-btn').disabled = !s.running;
   if (s.running) {
     const antSuffix = s.antenna ? ` · antenna ${s.antenna}` : '';
+    const listenSuffix = s.listen_audio ? ` · listening live -> ${s.listen_device || 'default sink'}` : '';
     if (s.kind === 'scan') {
       detail.textContent = `pid ${s.pid} · scanning "${s.group}"${antSuffix} · started ${new Date(s.started_at).toLocaleTimeString()}`;
     } else if (s.kind === 'dmr') {
@@ -791,7 +842,7 @@ async function refreshStatus() {
       if (s.record && s.voice_check === false) mode += ', voice check off';
       detail.textContent = `pid ${s.pid} · sweeping ${range} MHz (${mode})${antSuffix} · started ${new Date(s.started_at).toLocaleTimeString()}`;
     } else {
-      detail.textContent = `pid ${s.pid} · ${(s.freq_hz/1e6).toFixed(3)} MHz (${(s.mode || 'am').toUpperCase()}) · prefix ${s.prefix}${antSuffix} · started ${new Date(s.started_at).toLocaleTimeString()}`;
+      detail.textContent = `pid ${s.pid} · ${(s.freq_hz/1e6).toFixed(3)} MHz (${(s.mode || 'am').toUpperCase()}) · prefix ${s.prefix}${antSuffix}${listenSuffix} · started ${new Date(s.started_at).toLocaleTimeString()}`;
     }
   } else {
     detail.textContent = s.returncode !== null && s.returncode !== undefined ? `last exit code: ${s.returncode}` : 'not running';
@@ -927,11 +978,28 @@ function play(path, name) {
   player.play();
 }
 
+async function refreshAudioSinks() {
+  const res = await fetch('/api/audio-sinks');
+  const sinks = await res.json();
+  const select = document.getElementById('listen-device');
+  const prev = select.value;
+  select.innerHTML = '<option value="">System default</option>';
+  for (const s of sinks) {
+    const opt = document.createElement('option');
+    opt.value = s.name;
+    opt.textContent = s.name;
+    select.appendChild(opt);
+  }
+  if ([...select.options].some(o => o.value === prev)) select.value = prev;
+}
+
 async function startRecording() {
   const gainVal = document.getElementById('gain').value;
   const gain = gainVal === '' ? null : parseFloat(gainVal);
   const transcribe = document.getElementById('transcribe').checked;
   const antenna = document.getElementById('antenna').value || null;
+  const listenAudio = document.getElementById('listen').checked;
+  const listenDevice = document.getElementById('listen-device').value || null;
   let body;
   if (categorySelect.value === 'custom') {
     const mode = document.getElementById('custom-mode').value;
@@ -943,7 +1011,7 @@ async function startRecording() {
         freq_hz: parseFloat(document.getElementById('freq').value),
         mode,
         prefix: document.getElementById('prefix').value || 'REC',
-        gain, transcribe, antenna,
+        gain, transcribe, antenna, listen_audio: listenAudio, listen_device: listenDevice,
       };
     }
   } else if (categorySelect.value === 'allscan') {
@@ -953,7 +1021,10 @@ async function startRecording() {
   } else {
     const key = channelSelect.value.slice('record:'.length);
     const p = PRESETS[key];
-    body = { kind: 'record', key, freq_hz: p.freq, mode: p.mode, prefix: p.prefix, gain, transcribe, antenna };
+    body = {
+      kind: 'record', key, freq_hz: p.freq, mode: p.mode, prefix: p.prefix,
+      gain, transcribe, antenna, listen_audio: listenAudio, listen_device: listenDevice,
+    };
   }
   const res = await fetch('/api/start', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) alert((await res.json()).error);
@@ -1369,7 +1440,7 @@ async function refreshBrandmeisterCalls() {
 document.getElementById('bm-hours').addEventListener('change', refreshBrandmeisterCalls);
 document.getElementById('bm-talkgroup').addEventListener('change', refreshBrandmeisterCalls);
 
-refreshStatus(); refreshLogs(); refreshFiles();
+refreshStatus(); refreshLogs(); refreshFiles(); refreshAudioSinks();
 setInterval(refreshStatus, 2000);
 setInterval(refreshLogs, 2000);
 setInterval(refreshFiles, 5000);
@@ -1526,6 +1597,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(recorder.logs())
         elif parsed.path == "/api/files":
             self._send_json(list_audio_files())
+        elif parsed.path == "/api/audio-sinks":
+            self._send_json(list_audio_sinks())
         elif parsed.path == "/api/locate":
             self._handle_locate(parse_qs(parsed.query))
         elif parsed.path.startswith("/audio/"):
@@ -1638,7 +1711,10 @@ class Handler(BaseHTTPRequestHandler):
                     prefix = str(body.get("prefix") or "REC")
                     key = body.get("key")
                     category = PRESETS[key]["category"] if key in PRESETS else None
-                    recorder.start(freq_hz, mode, prefix, gain, transcribe, category, antenna)
+                    listen_audio = bool(body.get("listen_audio", False))
+                    listen_device = body.get("listen_device") or None
+                    recorder.start(freq_hz, mode, prefix, gain, transcribe, category, antenna,
+                                    listen_audio, listen_device)
                 elif kind == "dmr":
                     freq_hz = float(body["freq_hz"])
                     recorder.start_dmr(freq_hz, gain, transcribe, antenna)

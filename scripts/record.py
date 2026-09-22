@@ -12,9 +12,11 @@ import io
 import json
 import math
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -94,6 +96,88 @@ class FmDiscriminator:
         self._prev = iq[-1]
         prod = extended[1:] * np.conj(extended[:-1])
         return np.angle(prod).astype(np.float32)
+
+
+class LivePlayback:
+    """Streams every demodulated audio chunk to a local audio sink via paplay,
+    for hands-free live listening alongside (not gated by) the squelch-based
+    recording -- so you can just tune to a frequency and hear it, the way
+    gqrx does live, without running gqrx's GUI at all. Useful on this
+    project's Pi 5: the GUI's FFT/waterfall repaint is real RAM/CPU pressure
+    on a machine already running the recorder + webserver (see wsjtx_audio_
+    setup.sh's sibling problem -- that one routes audio INTO a virtual sink
+    for WSJT-X; this one gets audio OUT to a physical/BT/USB output).
+
+    Uses a fixed floor + slow-release AGC rather than write_wav's per-clip
+    peak normalization, since this is a live unbounded stream with no known
+    peak to normalize against in advance -- fast attack (jumps to a loud
+    chunk's peak immediately) avoids clipping, slow release (~1-2s decay)
+    avoids the volume visibly pumping between chunks. Same non-blocking
+    queue + writer-thread pattern as dmr.py's dsd-fme stdin feed: readStream()
+    must keep being serviced every ~0.1s regardless of whether audio playback
+    is keeping up, so a chunk is dropped rather than risking a block here.
+    """
+
+    AGC_FLOOR = 1e-3   # matches this project's documented raw-demod amplitude range (1e-4..1e-1)
+    AGC_RELEASE = 0.95  # per-chunk decay, ~1.3s time constant at CHUNK_SECONDS=0.1s
+    HEADROOM = 0.85
+
+    def __init__(self, audio_rate: int, device: str | None = None):
+        # No trailing filename/"-" argument: unlike most CLI tools, paplay
+        # doesn't treat "-" as a stdin placeholder -- it tries to literally
+        # open() a file named "-" and fails with ENOENT. Passing no filename
+        # argument at all is what makes it read from stdin.
+        cmd = ["paplay", "--raw", "--format=float32le", f"--rate={audio_rate}",
+               "--channels=1", "--latency-msec=100"]
+        if device:
+            cmd += [f"--device={device}"]
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._queue: "queue.Queue[bytes | None]" = queue.Queue(maxsize=50)  # ~5s headroom
+        self._peak = self.AGC_FLOOR
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        # Must be drained continuously or a chatty paplay can fill the pipe
+        # buffer and block it -- same rationale as dmr.py's dsd-fme forwarder.
+        threading.Thread(target=self._forward_stderr, daemon=True).start()
+
+    def _forward_stderr(self) -> None:
+        for raw_line in self._proc.stderr:
+            line = raw_line.decode("utf-8", "replace").rstrip("\n")
+            if line:
+                print(f"  [paplay] {line}", file=sys.stderr)
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            try:
+                self._proc.stdin.write(item)
+            except (BrokenPipeError, OSError):
+                return
+
+    def write(self, chunk: np.ndarray) -> None:
+        chunk_peak = float(np.max(np.abs(chunk))) if len(chunk) else 0.0
+        self._peak = max(chunk_peak, self._peak * self.AGC_RELEASE, self.AGC_FLOOR)
+        scaled = np.clip(chunk / self._peak * self.HEADROOM, -1.0, 1.0).astype(np.float32)
+        try:
+            self._queue.put_nowait(scaled.tobytes())
+        except queue.Full:
+            pass  # playback can't keep up -- drop this chunk rather than block the SDR read loop
+
+    def close(self) -> None:
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        try:
+            self._proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._proc.terminate()
 
 
 def open_sdr(gain_db, sample_rate=SAMPLE_RATE, bandwidth_hz=200_000, antenna=None):
@@ -332,8 +416,11 @@ def listen(freq_hz, mode, out_dir, prefix, gain_db, open_ratio, close_ratio,
            transcribe, whisper_bin, whisper_model, whisper_threads,
            category=None, runpod_api_key=None, runpod_endpoint=DEFAULT_RUNPOD_ENDPOINT,
            runpod_batch_size=RUNPOD_BATCH_SIZE,
-           quality_log=True, quality_log_path=None, quality_log_interval=60.0, antenna=None):
+           quality_log=True, quality_log_path=None, quality_log_interval=60.0, antenna=None,
+           listen_audio=False, listen_device=None):
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    live = LivePlayback(AUDIO_RATE, listen_device) if listen_audio else None
 
     quality_logger = None
     if quality_log:
@@ -413,8 +500,9 @@ def listen(freq_hz, mode, out_dir, prefix, gain_db, open_ratio, close_ratio,
             print(f"readStream error during calibration: {sr.ret}", file=sys.stderr)
     noise_floor = min(calib_powers) if calib_powers else 1e-6
 
+    listen_note = f", live audio -> {listen_device or 'default sink'}" if live is not None else ""
     print(f"Listening on {freq_hz / 1e6:.3f} MHz ({mode.upper()}), writing transmissions "
-          f"to {out_dir}/ -- Ctrl+C to stop", file=sys.stderr)
+          f"to {out_dir}/{listen_note} -- Ctrl+C to stop", file=sys.stderr)
 
     elapsed = 0.0
     try:
@@ -438,6 +526,9 @@ def listen(freq_hz, mode, out_dir, prefix, gain_db, open_ratio, close_ratio,
                 demod = fm_disc.apply(iq).astype(np.float64)
                 filtered, lp_zi = _lfilter(lp_b, lp_a, demod, zi=lp_zi)
                 audio_chunk = filtered[::DECIMATION].astype(np.float32)
+
+            if live is not None:
+                live.write(audio_chunk)
 
             if not recording:
                 noise_floor = 0.98 * noise_floor + 0.02 * chunk_power
@@ -496,6 +587,8 @@ def listen(freq_hz, mode, out_dir, prefix, gain_db, open_ratio, close_ratio,
                              tx_power_n, len(audio) / AUDIO_RATE)
         sdr.deactivateStream(rx)
         sdr.closeStream(rx)
+        if live is not None:
+            live.close()
         if runpod_batcher is not None:
             runpod_batcher.flush()
         if executor is not None:
@@ -564,6 +657,16 @@ def main() -> None:
                               "(default: <out-dir>/rf_quality.jsonl)")
     parser.add_argument("--quality-log-interval", type=float, default=60.0,
                          help="minimum seconds between idle noise-floor samples (default: 60)")
+    parser.add_argument("--listen", dest="listen_audio", action="store_true", default=False,
+                         help="also play the demodulated audio live to a local sink via paplay, "
+                              "so you can listen by ear -- independent of the squelch-gated "
+                              "recording, so you'll hear the noise floor between transmissions "
+                              "too (default: off)")
+    parser.add_argument("--listen-device", default=None,
+                         help="paplay --device sink name to play through (default: system "
+                              "default sink -- run `pactl get-default-sink` first if unsure, "
+                              "e.g. it may currently be set to wsjtx_in for the WSJT-X setup, "
+                              "which would silently swallow this)")
     args = parser.parse_args()
 
     gain = None if args.gain is not None and args.gain < 0 else args.gain
@@ -572,7 +675,8 @@ def main() -> None:
            args.min_duration, args.pre_roll, args.duration,
            args.transcribe, args.whisper_bin, args.whisper_model, args.whisper_threads,
            args.category, args.runpod_api_key, args.runpod_endpoint, args.runpod_batch_size,
-           args.quality_log, args.quality_log_path, args.quality_log_interval, args.antenna)
+           args.quality_log, args.quality_log_path, args.quality_log_interval, args.antenna,
+           args.listen_audio, args.listen_device)
 
 
 if __name__ == "__main__":
