@@ -741,8 +741,30 @@ INDEX_HTML = """<!doctype html>
   <h2>Waterfall <button id="waterfall-toggle-btn" onclick="toggleWaterfall()" style="font-size:0.8rem">Disable</button></h2>
   <p class="hint">Live FFT power across the whole swept range -- brighter/warmer means stronger signal.
     New rows scroll in from the top; the highlighted band marks whatever slice the sweep is
-    currently dwelling on. Hover the waterfall to read off a frequency.</p>
+    currently dwelling on. Hover the waterfall to read off a frequency, click to tune the SDR there
+    and (optionally) listen live -- this stops the sweep, since there's only one SDR; use "Resume
+    sweep" below to go back to surveying the same range.</p>
   <div id="waterfall-freq-label" class="hint"></div>
+  <div class="row">
+    <div>
+      <label><input type="checkbox" id="spectrum-listen" checked> listen live on click</label>
+    </div>
+    <div>
+      <label for="spectrum-listen-device">Play through</label>
+      <select id="spectrum-listen-device"></select>
+    </div>
+    <div>
+      <label for="spectrum-tune-mode">Tune mode</label>
+      <select id="spectrum-tune-mode">
+        <option value="am">AM</option>
+        <option value="fm" selected>FM</option>
+      </select>
+    </div>
+  </div>
+  <div id="spectrum-tuned-info" class="hint" style="display:none">
+    Sweep paused while tuned in -- waterfall is showing the last frame from before the click.
+    <button id="spectrum-resume-btn" onclick="resumeSpectrumSweep()">Resume sweep</button>
+  </div>
   <div id="wf-wrap" style="position:relative">
     <canvas id="spectrum-waterfall" width="900" height="260"
       style="width:100%;height:260px;background:#000;border-radius:4px;image-rendering:pixelated;display:block"></canvas>
@@ -848,14 +870,16 @@ async function refreshStatus() {
     detail.textContent = s.returncode !== null && s.returncode !== undefined ? `last exit code: ${s.returncode}` : 'not running';
   }
 
+  const isTuned = s.running && s.kind === 'record' && s.prefix === 'SPEC_TUNE';
   const spPill = document.getElementById('spectrum-status-pill');
   const spDetail = document.getElementById('spectrum-status-detail');
-  spPill.textContent = isSpectrum ? 'running' : (s.running ? 'busy (other tab)' : 'idle');
-  spPill.className = 'status-pill ' + (isSpectrum ? 'running' : 'idle');
+  spPill.textContent = isSpectrum ? 'running' : (isTuned ? 'listening' : (s.running ? 'busy (other tab)' : 'idle'));
+  spPill.className = 'status-pill ' + ((isSpectrum || isTuned) ? 'running' : 'idle');
   document.getElementById('spectrum-start-btn').disabled = s.running;
-  document.getElementById('spectrum-stop-btn').disabled = !isSpectrum;
-  spDetail.textContent = isSpectrum ? detail.textContent
+  document.getElementById('spectrum-stop-btn').disabled = !(isSpectrum || isTuned);
+  spDetail.textContent = (isSpectrum || isTuned) ? detail.textContent
     : (s.running ? `SDR is busy with "${s.kind}" -- stop it from the ${s.kind === 'dmr' ? 'Radio' : 'other'} tab first` : '');
+  document.getElementById('spectrum-tuned-info').style.display = (isTuned && lastSweepParams) ? 'block' : 'none';
 }
 
 async function refreshLogs() {
@@ -981,16 +1005,18 @@ function play(path, name) {
 async function refreshAudioSinks() {
   const res = await fetch('/api/audio-sinks');
   const sinks = await res.json();
-  const select = document.getElementById('listen-device');
-  const prev = select.value;
-  select.innerHTML = '<option value="">System default</option>';
-  for (const s of sinks) {
-    const opt = document.createElement('option');
-    opt.value = s.name;
-    opt.textContent = s.name;
-    select.appendChild(opt);
+  for (const id of ['listen-device', 'spectrum-listen-device']) {
+    const select = document.getElementById(id);
+    const prev = select.value;
+    select.innerHTML = '<option value="">System default</option>';
+    for (const s of sinks) {
+      const opt = document.createElement('option');
+      opt.value = s.name;
+      opt.textContent = s.name;
+      select.appendChild(opt);
+    }
+    if ([...select.options].some(o => o.value === prev)) select.value = prev;
   }
-  if ([...select.options].some(o => o.value === prev)) select.value = prev;
 }
 
 async function startRecording() {
@@ -1073,9 +1099,64 @@ async function startSpectrum() {
     voice_check: document.getElementById('spectrum-voice-check').checked,
     antenna: document.getElementById('spectrum-antenna').value || null,
   };
+  lastSweepParams = body;  // so a later click-to-tune's "Resume sweep" can restart this same sweep
   const res = await fetch('/api/start', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) alert((await res.json()).error);
   wfRangeKey = null;  // next frame's range may differ -- force the waterfall to clear
+  refreshStatus();
+}
+
+let lastSweepParams = null;
+
+// Stops whatever's running (sweep or a previous tuned-listen) and waits for the
+// SDR to actually release -- record.py/spectrum_scan.py handle SIGINT quickly,
+// but starting a new process while the old one is still mid-teardown just 409s,
+// so this polls briefly rather than guessing a fixed delay.
+async function stopAndWait() {
+  const status = await (await fetch('/api/status')).json();
+  if (!status.running) return status;
+  if (status.kind === 'spectrum' && !lastSweepParams) {
+    lastSweepParams = {
+      kind: 'spectrum', start_mhz: status.start_mhz, end_mhz: status.end_mhz,
+      gain: null, record: status.record, voice_check: status.voice_check, antenna: status.antenna,
+    };
+  }
+  await fetch('/api/stop', { method: 'POST' });
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 250));
+    const s = await (await fetch('/api/status')).json();
+    if (!s.running) return s;
+  }
+  return await (await fetch('/api/status')).json();
+}
+
+async function tuneListenAt(hz) {
+  await stopAndWait();
+  const gainVal = document.getElementById('spectrum-gain').value;
+  const body = {
+    kind: 'record',
+    freq_hz: hz,
+    mode: document.getElementById('spectrum-tune-mode').value,
+    prefix: 'SPEC_TUNE',
+    gain: gainVal === '' ? null : parseFloat(gainVal),
+    transcribe: false,
+    antenna: document.getElementById('spectrum-antenna').value || null,
+    listen_audio: document.getElementById('spectrum-listen').checked,
+    listen_device: document.getElementById('spectrum-listen-device').value || null,
+  };
+  const res = await fetch('/api/start', { method: 'POST', body: JSON.stringify(body) });
+  if (!res.ok) alert((await res.json()).error);
+  refreshStatus();
+}
+
+async function resumeSpectrumSweep() {
+  if (!lastSweepParams) return;
+  await stopAndWait();
+  const params = lastSweepParams;
+  lastSweepParams = null;
+  const res = await fetch('/api/start', { method: 'POST', body: JSON.stringify(params) });
+  if (!res.ok) alert((await res.json()).error);
+  wfRangeKey = null;
   refreshStatus();
 }
 
@@ -1128,6 +1209,14 @@ wfCanvas.addEventListener('mousemove', (e) => {
   label.style.left = (frac * 100) + '%';
   label.textContent = (hz / 1e6).toFixed(4) + ' MHz';
   label.style.display = 'block';
+});
+wfCanvas.style.cursor = 'crosshair';
+wfCanvas.addEventListener('click', (e) => {
+  if (wfStartHz === null || wfEndHz === null) return;
+  const rect = wfCanvas.getBoundingClientRect();
+  const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const hz = wfStartHz + (wfEndHz - wfStartHz) * frac;
+  tuneListenAt(hz);
 });
 wfCanvas.addEventListener('mouseleave', () => {
   document.getElementById('wf-hover-line').style.display = 'none';
