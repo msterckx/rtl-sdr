@@ -15,6 +15,10 @@ For each channel it dwells briefly, checking RF power against a per-channel
 noise floor; if a signal is found it stops hopping, demodulates and records
 the transmission (same squelch open/close logic as record.py), then resumes
 scanning from the next channel.
+
+DMR channels aren't scannable this way -- there's no RF-power squelch to
+hop on, dsd-fme itself has to run continuously against one fixed frequency.
+Use scripts/dmr.py for those instead.
 """
 
 import argparse
@@ -35,7 +39,7 @@ from record import (
     DEFAULT_WHISPER_BIN, DEFAULT_WHISPER_MODEL,
     DEFAULT_RUNPOD_ENDPOINT, RUNPOD_API_KEY_ENV, RUNPOD_BATCH_SIZE,
     open_sdr, DcBlocker, FmDiscriminator, write_wav, transcribe_file,
-    RunpodAtcBatcher,
+    RunpodAtcBatcher, QualityLogger,
 )
 
 _running = True
@@ -105,11 +109,17 @@ def scan(channels, out_dir, gain_db, dwell, open_ratio, close_ratio,
          hang_time, min_duration, pre_roll, transcribe,
          whisper_bin, whisper_model, whisper_threads,
          runpod_api_key=None, runpod_endpoint=DEFAULT_RUNPOD_ENDPOINT,
-         runpod_batch_size=RUNPOD_BATCH_SIZE):
+         runpod_batch_size=RUNPOD_BATCH_SIZE,
+         quality_log=True, quality_log_path=None, quality_log_interval=60.0, antenna=None):
     if not channels:
         raise ValueError("no channels to scan")
 
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    quality_logger = None
+    if quality_log:
+        qpath = Path(quality_log_path) if quality_log_path else out_dir / "rf_quality.jsonl"
+        quality_logger = QualityLogger(qpath, quality_log_interval)
 
     executor = None
     runpod_batcher = None
@@ -124,13 +134,13 @@ def scan(channels, out_dir, gain_db, dwell, open_ratio, close_ratio,
                   f"({whisper_bin}, {whisper_model})", file=sys.stderr)
 
     def maybe_transcribe(path: Path, category, skip_ms: float = 0.0) -> None:
-        if category == "atc" and runpod_batcher is not None:
+        if category is not None and category.startswith("atc") and runpod_batcher is not None:
             runpod_batcher.add(path, skip_ms)
         elif executor is not None and whisper_available:
             executor.submit(transcribe_file, path, whisper_bin, whisper_model,
                              whisper_threads, skip_ms)
 
-    sdr = open_sdr(gain_db)
+    sdr = open_sdr(gain_db, antenna=antenna)
     rx = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
     sdr.activateStream(rx)
 
@@ -187,6 +197,9 @@ def scan(channels, out_dir, gain_db, dwell, open_ratio, close_ratio,
 
             if not locked:
                 noise_floor[chan.key] = 0.98 * noise_floor[chan.key] + 0.02 * min(dwell_powers)
+                if quality_logger is not None:
+                    quality_logger.maybe_log_idle(chan.key, chan.prefix, chan.freq_hz,
+                                                   chan.mode, noise_floor[chan.key])
                 continue
 
             tx_start_time = datetime.now()
@@ -194,12 +207,18 @@ def scan(channels, out_dir, gain_db, dwell, open_ratio, close_ratio,
                   f"({chan.freq_hz / 1e6:.4f} MHz)", file=sys.stderr)
             tx_buffer = dwell_audio[-pre_roll_chunks:] if pre_roll_chunks else []
             tx_preroll_ms = len(tx_buffer) * CHUNK_SECONDS * 1000
+            tx_peak_power = max(dwell_powers) if dwell_powers else 0.0
+            tx_power_sum = sum(dwell_powers)
+            tx_power_n = len(dwell_powers)
             close_counter = 0
             while True:
                 iq = read_chunk()
                 chunk_power, audio_chunk, lp_zi = demod_chunk(
                     iq, chan.mode, lp_b, lp_a, lp_zi, dc_blocker, fm_disc)
                 tx_buffer.append(audio_chunk)
+                tx_peak_power = max(tx_peak_power, chunk_power)
+                tx_power_sum += chunk_power
+                tx_power_n += 1
                 if chunk_power < noise_floor[chan.key] * close_ratio:
                     close_counter += 1
                 else:
@@ -214,6 +233,12 @@ def scan(channels, out_dir, gain_db, dwell, open_ratio, close_ratio,
                 print(f"[{tx_start_time:%H:%M:%S}] wrote {path.name} "
                       f"({len(audio) / AUDIO_RATE:.1f}s)", file=sys.stderr)
                 maybe_transcribe(path, chan.category, tx_preroll_ms)
+                if quality_logger is not None:
+                    quality_logger.log_tx(
+                        chan.key, chan.prefix, chan.freq_hz, chan.mode,
+                        noise_floor[chan.key], tx_peak_power,
+                        tx_power_sum / tx_power_n if tx_power_n else tx_peak_power,
+                        len(audio) / AUDIO_RATE, path.name)
     except _StopScan:
         pass
     finally:
@@ -242,6 +267,8 @@ def main() -> None:
     parser.add_argument("--out-dir", default="output", help="output directory for WAV files")
     parser.add_argument("--gain", type=float, default=40.0,
                          help="manual RF gain in dB, 0-66 (default: 40); pass --gain=-1 for AGC")
+    parser.add_argument("--antenna", choices=["A", "B", "C"], default=None,
+                         help="RSPdx antenna input to use (default: device default, Antenna A)")
     parser.add_argument("--dwell", type=float, default=0.3,
                          help="seconds to sample each idle channel before moving on")
     parser.add_argument("--open-ratio", type=float, default=4.0,
@@ -272,6 +299,17 @@ def main() -> None:
                          help="RunPod ATC transcription endpoint URL")
     parser.add_argument("--runpod-batch-size", type=int, default=RUNPOD_BATCH_SIZE,
                          help=f"ATC clips to bundle per RunPod request (default: {RUNPOD_BATCH_SIZE})")
+    parser.add_argument("--quality-log", dest="quality_log", action="store_true", default=True,
+                         help="log noise-floor/SNR samples to <out-dir>/rf_quality.jsonl, for "
+                              "tracking receiver/antenna quality over time (default: on)")
+    parser.add_argument("--no-quality-log", dest="quality_log", action="store_false",
+                         help="disable quality logging")
+    parser.add_argument("--quality-log-path", default=None,
+                         help="override the quality log file path "
+                              "(default: <out-dir>/rf_quality.jsonl)")
+    parser.add_argument("--quality-log-interval", type=float, default=60.0,
+                         help="minimum seconds between idle noise-floor samples per channel "
+                              "(default: 60)")
     args = parser.parse_args()
 
     channels = resolve_channels(args.group, args.channels, args.freqs)
@@ -280,7 +318,8 @@ def main() -> None:
          args.open_ratio, args.close_ratio, args.hang_time,
          args.min_duration, args.pre_roll, args.transcribe,
          args.whisper_bin, args.whisper_model, args.whisper_threads,
-         args.runpod_api_key, args.runpod_endpoint, args.runpod_batch_size)
+         args.runpod_api_key, args.runpod_endpoint, args.runpod_batch_size,
+         args.quality_log, args.quality_log_path, args.quality_log_interval, args.antenna)
 
 
 if __name__ == "__main__":

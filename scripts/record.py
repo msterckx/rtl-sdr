@@ -10,10 +10,12 @@ import argparse
 import base64
 import io
 import json
+import math
 import os
 import signal
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import wave
@@ -43,8 +45,8 @@ WHISPER_DIR = Path("/home/michel/src/whisper.cpp")
 DEFAULT_WHISPER_BIN = WHISPER_DIR / "build" / "bin" / "whisper-cli"
 DEFAULT_WHISPER_MODEL = WHISPER_DIR / "models" / "ggml-base.en.bin"
 
-# Hosted ATC-tuned Whisper model (RunPod serverless), used only for
-# category == "atc" clips instead of the generic local whisper.cpp model.
+# Hosted ATC-tuned Whisper model (RunPod serverless), used only for clips
+# whose category starts with "atc" instead of the generic local whisper.cpp model.
 # The key is never hardcoded here since it grants billable API access --
 # read it from the environment (or --runpod-api-key) at call time.
 DEFAULT_RUNPOD_ENDPOINT = "https://api.runpod.ai/v2/sgb8a8v6ielxna/runsync"
@@ -94,13 +96,17 @@ class FmDiscriminator:
         return np.angle(prod).astype(np.float32)
 
 
-def open_sdr(gain_db):
+def open_sdr(gain_db, sample_rate=SAMPLE_RATE, bandwidth_hz=200_000, antenna=None):
     candidates = [r for r in SoapySDR.Device.enumerate() if r["driver"] == "sdrplay"]
     if not candidates:
         raise RuntimeError("no sdrplay device found")
     sdr = SoapySDR.Device(candidates[0])
-    sdr.setSampleRate(SOAPY_SDR_RX, 0, SAMPLE_RATE)
-    sdr.setBandwidth(SOAPY_SDR_RX, 0, 200_000)
+    sdr.setSampleRate(SOAPY_SDR_RX, 0, sample_rate)
+    sdr.setBandwidth(SOAPY_SDR_RX, 0, bandwidth_hz)
+    if antenna:
+        # SoapySDR's sdrplay driver wants the full name ("Antenna A"), not
+        # just the letter our --antenna flag takes.
+        sdr.setAntenna(SOAPY_SDR_RX, 0, f"Antenna {antenna}")
     if gain_db is None:
         sdr.setGainMode(SOAPY_SDR_RX, 0, True)  # AGC
     else:
@@ -271,19 +277,75 @@ class RunpodAtcBatcher:
         self._executor.submit(transcribe_runpod_batch, batch, self._api_key, self._endpoint)
 
 
+class QualityLogger:
+    """Appends one JSON line per squelch event -- an idle noise-floor sample,
+    or a completed transmission's peak/mean signal level -- to a shared log
+    file, keyed by channel (preset key/prefix) so per-channel idle sampling
+    is throttled independently in scan.py's multi-channel case.
+
+    This is the raw data for tracking receiver+antenna quality over time
+    (SNR trend on a given channel, noise-floor drift across antenna/gain
+    changes, day/night variation) without needing a transmission to compare
+    against -- the complementary check is flight_lookup.py's ADS-B distance
+    lookup, which ties a specific recording to a verified slant range.
+    """
+
+    def __init__(self, path: Path, idle_interval: float = 60.0):
+        self.path = path
+        self.idle_interval = idle_interval
+        self._last_idle: dict[str, float] = {}
+
+    def _write(self, record: dict) -> None:
+        record["ts"] = datetime.now().astimezone().isoformat()
+        try:
+            with open(self.path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as exc:
+            print(f"quality log write failed: {exc}", file=sys.stderr)
+
+    def log_tx(self, key: str, prefix: str, freq_hz: float, mode: str,
+               noise_floor: float, peak_power: float, mean_power: float,
+               duration_s: float, wav_name: str) -> None:
+        snr_db = (10 * math.log10(peak_power / noise_floor)
+                  if noise_floor > 0 and peak_power > 0 else None)
+        self._write({
+            "event": "tx", "prefix": prefix, "freq_hz": freq_hz, "mode": mode,
+            "noise_floor": noise_floor, "peak_power": peak_power,
+            "mean_power": mean_power, "snr_db": snr_db,
+            "duration_s": duration_s, "wav": wav_name,
+        })
+
+    def maybe_log_idle(self, key: str, prefix: str, freq_hz: float, mode: str,
+                        noise_floor: float) -> None:
+        now = time.monotonic()
+        if now - self._last_idle.get(key, -self.idle_interval) < self.idle_interval:
+            return
+        self._last_idle[key] = now
+        self._write({
+            "event": "idle", "prefix": prefix, "freq_hz": freq_hz, "mode": mode,
+            "noise_floor": noise_floor,
+        })
+
+
 def listen(freq_hz, mode, out_dir, prefix, gain_db, open_ratio, close_ratio,
            hang_time, min_duration, pre_roll, duration,
            transcribe, whisper_bin, whisper_model, whisper_threads,
            category=None, runpod_api_key=None, runpod_endpoint=DEFAULT_RUNPOD_ENDPOINT,
-           runpod_batch_size=RUNPOD_BATCH_SIZE):
+           runpod_batch_size=RUNPOD_BATCH_SIZE,
+           quality_log=True, quality_log_path=None, quality_log_interval=60.0, antenna=None):
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    quality_logger = None
+    if quality_log:
+        qpath = Path(quality_log_path) if quality_log_path else out_dir / "rf_quality.jsonl"
+        quality_logger = QualityLogger(qpath, quality_log_interval)
 
     executor = None
     runpod_batcher = None
     whisper_available = Path(whisper_bin).exists() and Path(whisper_model).exists()
     if transcribe:
         executor = ThreadPoolExecutor(max_workers=2)
-        if category == "atc" and runpod_api_key:
+        if category is not None and category.startswith("atc") and runpod_api_key:
             runpod_batcher = RunpodAtcBatcher(executor, runpod_api_key, runpod_endpoint,
                                                runpod_batch_size)
         if runpod_batcher is None and not whisper_available:
@@ -297,7 +359,14 @@ def listen(freq_hz, mode, out_dir, prefix, gain_db, open_ratio, close_ratio,
             executor.submit(transcribe_file, path, whisper_bin, whisper_model,
                              whisper_threads, skip_ms)
 
-    sdr = open_sdr(gain_db)
+    def maybe_log_tx(path: Path, floor: float, peak: float, power_sum: float,
+                      power_n: int, duration_s: float) -> None:
+        if quality_logger is not None:
+            quality_logger.log_tx(prefix, prefix, freq_hz, mode, floor, peak,
+                                   power_sum / power_n if power_n else peak,
+                                   duration_s, path.name)
+
+    sdr = open_sdr(gain_db, antenna=antenna)
     sdr.setFrequency(SOAPY_SDR_RX, 0, freq_hz)
     rx = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
     sdr.activateStream(rx)
@@ -319,6 +388,9 @@ def listen(freq_hz, mode, out_dir, prefix, gain_db, open_ratio, close_ratio,
     tx_buffer = []
     tx_start_time = None
     tx_preroll_ms = 0.0
+    tx_peak_power = 0.0
+    tx_power_sum = 0.0
+    tx_power_n = 0
     pre_roll_buf = deque(maxlen=pre_roll_chunks)
 
     buff = np.empty(CHUNK_SAMPLES, np.complex64)
@@ -369,6 +441,8 @@ def listen(freq_hz, mode, out_dir, prefix, gain_db, open_ratio, close_ratio,
 
             if not recording:
                 noise_floor = 0.98 * noise_floor + 0.02 * chunk_power
+                if quality_logger is not None:
+                    quality_logger.maybe_log_idle(prefix, prefix, freq_hz, mode, noise_floor)
 
             if not recording:
                 pre_roll_buf.append(audio_chunk)
@@ -384,8 +458,14 @@ def listen(freq_hz, mode, out_dir, prefix, gain_db, open_ratio, close_ratio,
                     pre_roll_buf.clear()
                     open_counter = 0
                     close_counter = 0
+                    tx_peak_power = chunk_power
+                    tx_power_sum = 0.0
+                    tx_power_n = 0
             else:
                 tx_buffer.append(audio_chunk)
+                tx_peak_power = max(tx_peak_power, chunk_power)
+                tx_power_sum += chunk_power
+                tx_power_n += 1
                 if chunk_power < noise_floor * close_ratio:
                     close_counter += 1
                 else:
@@ -398,6 +478,8 @@ def listen(freq_hz, mode, out_dir, prefix, gain_db, open_ratio, close_ratio,
                         print(f"[{tx_start_time:%H:%M:%S}] wrote {path.name} "
                               f"({len(audio) / AUDIO_RATE:.1f}s)", file=sys.stderr)
                         maybe_transcribe(path, tx_preroll_ms)
+                        maybe_log_tx(path, noise_floor, tx_peak_power, tx_power_sum,
+                                     tx_power_n, len(audio) / AUDIO_RATE)
                     recording = False
                     tx_buffer = []
                     close_counter = 0
@@ -410,6 +492,8 @@ def listen(freq_hz, mode, out_dir, prefix, gain_db, open_ratio, close_ratio,
                 print(f"[{tx_start_time:%H:%M:%S}] wrote {path.name} "
                       f"({len(audio) / AUDIO_RATE:.1f}s)", file=sys.stderr)
                 maybe_transcribe(path, tx_preroll_ms)
+                maybe_log_tx(path, noise_floor, tx_peak_power, tx_power_sum,
+                             tx_power_n, len(audio) / AUDIO_RATE)
         sdr.deactivateStream(rx)
         sdr.closeStream(rx)
         if runpod_batcher is not None:
@@ -435,6 +519,8 @@ def main() -> None:
                          help="manual RF gain in dB, 0-66 (default: 40). AGC is NOT used by "
                               "default because it renormalizes power and defeats the "
                               "amplitude-based squelch; pass --gain=-1 to force AGC instead.")
+    parser.add_argument("--antenna", choices=["A", "B", "C"], default=None,
+                         help="RSPdx antenna input to use (default: device default, Antenna A)")
     parser.add_argument("--open-ratio", type=float, default=4.0,
                          help="signal/noise power ratio to open squelch")
     parser.add_argument("--close-ratio", type=float, default=2.0,
@@ -468,6 +554,16 @@ def main() -> None:
                          help="RunPod ATC transcription endpoint URL")
     parser.add_argument("--runpod-batch-size", type=int, default=RUNPOD_BATCH_SIZE,
                          help=f"ATC clips to bundle per RunPod request (default: {RUNPOD_BATCH_SIZE})")
+    parser.add_argument("--quality-log", dest="quality_log", action="store_true", default=True,
+                         help="log noise-floor/SNR samples to <out-dir>/rf_quality.jsonl, for "
+                              "tracking receiver/antenna quality over time (default: on)")
+    parser.add_argument("--no-quality-log", dest="quality_log", action="store_false",
+                         help="disable quality logging")
+    parser.add_argument("--quality-log-path", default=None,
+                         help="override the quality log file path "
+                              "(default: <out-dir>/rf_quality.jsonl)")
+    parser.add_argument("--quality-log-interval", type=float, default=60.0,
+                         help="minimum seconds between idle noise-floor samples (default: 60)")
     args = parser.parse_args()
 
     gain = None if args.gain is not None and args.gain < 0 else args.gain
@@ -475,7 +571,8 @@ def main() -> None:
            args.open_ratio, args.close_ratio, args.hang_time,
            args.min_duration, args.pre_roll, args.duration,
            args.transcribe, args.whisper_bin, args.whisper_model, args.whisper_threads,
-           args.category, args.runpod_api_key, args.runpod_endpoint, args.runpod_batch_size)
+           args.category, args.runpod_api_key, args.runpod_endpoint, args.runpod_batch_size,
+           args.quality_log, args.quality_log_path, args.quality_log_interval, args.antenna)
 
 
 if __name__ == "__main__":
