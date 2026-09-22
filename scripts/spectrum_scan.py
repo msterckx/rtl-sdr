@@ -45,7 +45,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import butter, lfilter
+from scipy.signal import butter, lfilter, medfilt
 from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
 
 from record import AUDIO_RATE, CHUNK_SECONDS, DcBlocker, FmDiscriminator, open_sdr, write_wav
@@ -56,6 +56,7 @@ DEFAULT_STEP_MHZ = 8.0    # widest IF filter bandwidth SDRplay RSP devices suppo
 DEFAULT_FFT_SIZE = 4096
 DEFAULT_OVERLAP = 0.85     # advance each step by 85% of its width, 15% overlap at the edges
 DC_GUARD_BINS = 4          # bins either side of center to ignore (LO/DC leakage)
+DEFAULT_SPECTRAL_WINDOW_HZ = 200_000.0  # width of the rolling-median neighbor-floor window
 
 # Mode-guessing heuristic for --record, matching presets.py's own convention:
 # the civil VHF airband is AM, everything else this project cares about is FM.
@@ -282,12 +283,44 @@ def contiguous_runs(mask: np.ndarray) -> np.ndarray:
     return idx.reshape(-1, 2)
 
 
-def detect_hits(power, noise_floor_bins, freqs, bin_hz, open_ratio, min_bins, max_bins, dc_guard):
-    """Compare one power spectrum against its per-bin noise floor and return
-    (hits, active_mask, power_with_dc_guard_applied). Each hit is a
-    (centroid_hz, bandwidth_hz, peak_power, local_noise_floor) tuple. Pure
-    detection -- no logging -- so both the log-only and --record code paths
-    share one definition of "what counts as activity".
+def spectral_floor(power: np.ndarray, kernel_bins: int) -> np.ndarray:
+    """Rolling-median estimate of each bin's *surrounding* spectrum level,
+    computed fresh from this one capture -- no time history involved. A
+    median (not mean) over a window much wider than any plausible channel
+    means a real signal's own bins are a small minority of the window and
+    get outvoted, so the signal doesn't drag up its own local floor estimate.
+
+    This is what actually lets a continuously-present carrier (a broadcast
+    station, a beacon) get flagged as a hit: noise_floor_bins (the per-bin
+    *time*-adaptive baseline in survey()) gets seeded from this exact signal
+    the very first time seed_step() runs, since it has no on/off cycle to
+    seed against -- from then on the signal never reads as more than ~1x its
+    own baseline, no matter how strong it is. Comparing against neighboring
+    *frequencies* instead sidesteps that entirely: the station only has to
+    stand out from the quiet spectrum around it, which it does whether it's
+    been on for a second or a decade."""
+    kernel_bins = min(kernel_bins | 1, power.size - (1 - power.size % 2))  # odd, <= array size
+    if kernel_bins < 3:
+        return power.copy()
+    return medfilt(power, kernel_size=kernel_bins)
+
+
+def detect_hits(power, noise_floor_bins, freqs, bin_hz, open_ratio, min_bins, max_bins, dc_guard,
+                 spectral_window_bins=None):
+    """Compare one power spectrum against its per-bin noise floor AND its
+    local spectral neighborhood, and return (hits, active_mask,
+    power_with_dc_guard_applied). Each hit is a (centroid_hz, bandwidth_hz,
+    peak_power, local_noise_floor) tuple. Pure detection -- no logging -- so
+    both the log-only and --record code paths share one definition of "what
+    counts as activity".
+
+    Two independent checks, OR'd together: the per-bin *time* baseline
+    (noise_floor_bins, catches a burst rising out of an otherwise-quiet
+    channel -- ATC/marine/ham/PMR traffic) and the per-bin *spectral*
+    neighbor baseline (spectral_floor(), catches a signal that's always on
+    but still stands out from the dead air around it -- broadcast stations,
+    beacons). Neither alone covers both cases; see spectral_floor()'s
+    docstring for why the time baseline structurally can't catch the latter.
 
     min_bins/max_bins bound the plausible width of a real narrowband voice
     channel: too few bins is usually a single noisy FFT spike, too many is
@@ -296,6 +329,9 @@ def detect_hits(power, noise_floor_bins, freqs, bin_hz, open_ratio, min_bins, ma
     power = power.copy()
     power[dc_guard] = noise_floor_bins[dc_guard]
     active = power > noise_floor_bins * open_ratio
+    if spectral_window_bins:
+        floor_bins = spectral_floor(power, spectral_window_bins)
+        active = active | (power > floor_bins * open_ratio)
     hits = []
     for lo, hi in contiguous_runs(active):
         if not (min_bins <= hi - lo <= max_bins):
@@ -435,7 +471,7 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
            open_ratio, relog_interval, out_path, min_bandwidth_hz, max_bandwidth_hz,
            record_audio=False, out_dir=None, hang_time=1.0, min_duration=0.4, pre_roll=0.3,
            voice_check=True, flatness_threshold=0.3, min_modulation_db=15.0, open_chunks=2,
-           waterfall_out=None, antenna=None):
+           waterfall_out=None, antenna=None, spectral_window_hz=DEFAULT_SPECTRAL_WINDOW_HZ):
     steps = build_steps(start_hz, end_hz, step_hz, overlap)
     if not steps:
         raise ValueError("empty sweep range")
@@ -465,6 +501,11 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
     match_tolerance_hz = max(bin_hz * 4, 2_000.0)
     min_bins = max(1, round(min_bandwidth_hz / bin_hz))
     max_bins = max(min_bins, round(max_bandwidth_hz / bin_hz))
+    # Comfortably wider than the widest legit channel (max_bins) so a real
+    # signal is always a small minority of its own median window -- see
+    # spectral_floor()'s docstring. 0/None disables the spectral check.
+    spectral_window_bins = (max(2 * max_bins + 1, round(spectral_window_hz / bin_hz))
+                             if spectral_window_hz else None)
 
     reader = StreamReader(sdr, rx, chunk_samples)
     read_n = reader.read_n
@@ -567,7 +608,8 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
             return
         freqs = center - step_hz / 2 + bin_hz * np.arange(fft_size)
         hits, active, power = detect_hits(power, noise_floor[i], freqs, bin_hz,
-                                           open_ratio, min_bins, max_bins, dc_guard)
+                                           open_ratio, min_bins, max_bins, dc_guard,
+                                           spectral_window_bins)
         for centroid, bandwidth, peak, local_floor in hits:
             log_new_hit(centroid, bandwidth, peak, local_floor)
         idle = ~active
@@ -604,7 +646,8 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
             iq = read_n(chunk_samples)
             power = power_spectrum(iq, fft_size)
             hits, active, power = detect_hits(power, noise_floor[i], freqs, bin_hz,
-                                               open_ratio, min_bins, max_bins, dc_guard)
+                                               open_ratio, min_bins, max_bins, dc_guard,
+                                               spectral_window_bins)
 
             matched_ids = set()
             matched_pending = set()
@@ -775,6 +818,15 @@ def main() -> None:
                               "this, unlike spoken syllables/pauses -- catches steady interferers "
                               "that pass the flatness check since a held tone's spectrum is even "
                               "less flat than voice's, not more, only used with --record")
+    parser.add_argument("--spectral-window-hz", type=float, default=DEFAULT_SPECTRAL_WINDOW_HZ,
+                         help="width of the rolling-median neighbor-frequency baseline a bin is "
+                              f"also compared against (default: {DEFAULT_SPECTRAL_WINDOW_HZ:.0f}); "
+                              "this is what lets an always-on signal (a broadcast station, a beacon) "
+                              "register as a hit at all -- the per-bin time baseline alone can't, "
+                              "since a continuous signal gets baked into its own noise-floor seed "
+                              "and never reads as above it; pass 0 to disable and rely on the time "
+                              "baseline only (bursty-traffic-only behavior, as before this option "
+                              "existed)")
     args = parser.parse_args()
 
     gain = None if args.gain is not None and args.gain < 0 else args.gain
@@ -784,7 +836,7 @@ def main() -> None:
            record_audio=args.record, out_dir=args.out_dir, hang_time=args.hang_time,
            min_duration=args.min_duration, pre_roll=args.pre_roll,
            voice_check=args.voice_check, flatness_threshold=args.flatness_threshold,
-           min_modulation_db=args.min_modulation_db,
+           min_modulation_db=args.min_modulation_db, spectral_window_hz=args.spectral_window_hz,
            open_chunks=args.open_chunks, waterfall_out=args.waterfall_out, antenna=args.antenna)
 
 
