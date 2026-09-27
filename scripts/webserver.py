@@ -36,6 +36,7 @@ import brandmeister
 import flight_lookup
 import pass_predict
 import shortwave_id
+import sonde_data
 from presets import PRESETS, GROUPS, CATEGORY_LABELS, DMR_REPEATERS, SPECTRUM_RANGES
 from satellites import SATELLITES
 
@@ -45,6 +46,7 @@ SCAN_SCRIPT = PROJECT_ROOT / "scripts" / "scan.py"
 SATELLITE_SCRIPT = PROJECT_ROOT / "scripts" / "satellite.py"
 DMR_SCRIPT = PROJECT_ROOT / "scripts" / "dmr.py"
 SPECTRUM_SCRIPT = PROJECT_ROOT / "scripts" / "spectrum_scan.py"
+SONDE_SCRIPT = PROJECT_ROOT / "scripts" / "sonde.py"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 SATELLITE_DIR = OUTPUT_DIR / "satellite"
 SATELLITE_SCHEDULE_PATH = SATELLITE_DIR / "schedule.json"
@@ -53,6 +55,7 @@ BRANDMEISTER_LOG_PATH = BRANDMEISTER_DIR / "calls.json"
 SPECTRUM_LOG_PATH = OUTPUT_DIR / "spectrum_survey.jsonl"
 SPECTRUM_WATERFALL_PATH = OUTPUT_DIR / "spectrum_waterfall.json"
 SPECTRUM_HITS_LIMIT = 200
+SONDE_DIR = OUTPUT_DIR / "sonde"
 
 LOG_MAXLEN = 1000
 STOP_GRACE_SECONDS = 20
@@ -90,6 +93,8 @@ class Recorder:
                 "antenna": meta.get("antenna"),
                 "listen_audio": meta.get("listen_audio"),
                 "listen_device": meta.get("listen_device"),
+                "sonde_freqs": meta.get("sonde_freqs"),
+                "sonde_type": meta.get("sonde_type"),
                 "started_at": self._started_at.isoformat() if self._started_at else None,
                 "returncode": self._returncode,
             }
@@ -224,6 +229,19 @@ class Recorder:
                              {"kind": "spectrum", "start_mhz": start_mhz, "end_mhz": end_mhz,
                               "record": record, "voice_check": voice_check, "antenna": antenna},
                              antenna)
+
+    def start_sonde(self, freqs_hz: list[float], sonde_type: str, gain: float | None,
+                     antenna: str | None = None):
+        """Radiosonde tracking (scripts/sonde.py) -- sweeps 400-406 MHz for
+        sondes when freqs_hz is empty, otherwise sits on those frequencies.
+        Same single-SDR-owner slot as everything else; transcribe=True only
+        so no --no-transcribe flag sonde.py doesn't have gets added."""
+        cmd = [sys.executable, str(SONDE_SCRIPT), "--out-dir", str(SONDE_DIR), "--type", sonde_type]
+        for f in freqs_hz:
+            cmd = cmd + ["--freq", str(f)]
+        self._start_process(cmd, gain, True,
+                             {"kind": "sonde", "sonde_freqs": freqs_hz, "sonde_type": sonde_type,
+                              "antenna": antenna}, antenna)
 
     def stop(self):
         with self._lock:
@@ -530,6 +548,15 @@ INDEX_HTML = """<!doctype html>
   .gallery figure { margin: 0; width: 200px; }
   .gallery img { width: 100%; border-radius: 6px; display: block; }
   .gallery figcaption { font-size: 0.8rem; color: #888; margin-top: 0.3rem; }
+  #sonde-map { height: 420px; border-radius: 6px; margin: 0.5rem 0; }
+  .sonde-stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 0.5rem; margin: 0.5rem 0; }
+  .sonde-stats div { background: #8881; border-radius: 6px; padding: 0.4rem 0.6rem; }
+  .sonde-stats .k { font-size: 0.75rem; color: #888; }
+  .sonde-stats .v { font-size: 1.05rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  tr.selected td { background: #2563eb22; }
+  #sonde-flights-body tr { cursor: pointer; }
+  .table-scroll { overflow-x: auto; }
+  #sonde-profile { width: 100%; height: 170px; }
 </style>
 </head>
 <body>
@@ -540,6 +567,7 @@ INDEX_HTML = """<!doctype html>
   <button id="tab-btn-satellite" onclick="showTab('satellite')">Satellites</button>
   <button id="tab-btn-dmr" onclick="showTab('dmr')">DMR</button>
   <button id="tab-btn-spectrum" onclick="showTab('spectrum')">Spectrum</button>
+  <button id="tab-btn-sonde" onclick="showTab('sonde')">Sondes</button>
 </div>
 
 <div id="tab-radio">
@@ -799,6 +827,98 @@ INDEX_HTML = """<!doctype html>
 
 </div>
 
+<div id="tab-sonde" style="display:none">
+
+<section>
+  <h2>Weather balloons (radiosondes) <span id="sonde-status-pill" class="status-pill idle">idle</span></h2>
+  <p class="hint">Finds and decodes radiosondes in the 400-406 MHz band -- Vaisala RS41, Graw DFM, Meteomodem M10/M20 and
+    iMet-4 -- and logs their telemetry (GPS position, altitude, climb rate, temperature, humidity, pressure, battery).
+    Synoptic launches go up roughly an hour before 00 and 12 UTC (some stations also 06/18 UTC); a sonde climbs to ~30 km
+    over about 90 minutes, bursts, and parachutes down. The "Up now" list below (from SondeHub) shows what's airborne and on which frequency.</p>
+  <p id="sonde-status-detail" class="hint">not running</p>
+  <div class="row">
+    <div>
+      <label for="sonde-mode">Mode</label>
+      <select id="sonde-mode" onchange="document.getElementById('sonde-freq-field').style.display = this.value === 'freq' ? '' : 'none'">
+        <option value="sweep">Sweep 400-406 MHz</option>
+        <option value="freq">Fixed frequency</option>
+      </select>
+    </div>
+    <div id="sonde-freq-field" style="display:none">
+      <label for="sonde-freq">Freq MHz (comma-separate several)</label>
+      <input type="text" id="sonde-freq" placeholder="402.700" style="width:12rem">
+    </div>
+    <div>
+      <label for="sonde-type">Type</label>
+      <select id="sonde-type">
+        <option value="auto">Auto-detect</option>
+        <option value="RS41">RS41</option>
+        <option value="DFM">DFM</option>
+        <option value="M10">M10 / M20</option>
+        <option value="IMET4">iMet-4</option>
+      </select>
+    </div>
+    <div>
+      <label for="sonde-gain">Gain dB (blank = 40)</label>
+      <input type="number" id="sonde-gain" step="1" style="width:6rem">
+    </div>
+    <div>
+      <label for="sonde-antenna">Antenna</label>
+      <select id="sonde-antenna">
+        <option value="">Default (Antenna A)</option>
+        <option value="A">Antenna A</option>
+        <option value="B">Antenna B</option>
+        <option value="C">Antenna C</option>
+      </select>
+    </div>
+    <div>
+      <button class="primary" id="sonde-start-btn" onclick="startSonde()">Start</button>
+      <button class="danger" id="sonde-stop-btn" onclick="stopRecording()">Stop</button>
+    </div>
+  </div>
+  <p id="sonde-receiver-summary" class="hint"></p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Freq</th><th>State</th><th>Type</th><th>Serial</th><th>SNR</th><th>Frames</th><th>Last frame</th></tr></thead>
+    <tbody id="sonde-channels-body"></tbody>
+  </table>
+  </div>
+  <h3>Log</h3>
+  <pre id="sonde-log"></pre>
+</section>
+
+<section>
+  <h2>Received flights</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Serial</th><th>Type</th><th>Freq</th><th>Last heard</th><th>Alt</th><th>Climb</th><th>Temp</th><th>RH</th><th>Range</th><th>Frames</th><th></th></tr></thead>
+    <tbody id="sonde-flights-body"></tbody>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2 id="sonde-selected-title">Map</h2>
+  <div class="sonde-stats" id="sonde-stats"></div>
+  <div id="sonde-map"></div>
+  <label class="hint"><input type="checkbox" id="sonde-show-nearby" checked onchange="refreshSondeNearby()"> show sondes SondeHub hears nearby (grey)</label>
+  <svg id="sonde-profile" viewBox="0 0 600 170" preserveAspectRatio="none"></svg>
+  <p class="hint" id="sonde-profile-caption"></p>
+</section>
+
+<section>
+  <h2>Up now nearby (SondeHub)</h2>
+  <p class="hint" id="sonde-nearby-hint">Sondes heard by <a href="https://sondehub.org" target="_blank" rel="noopener">SondeHub</a> receivers within 400 km in the last 3 hours.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Serial</th><th>Type</th><th>Freq</th><th>Alt</th><th>Climb</th><th>Distance</th><th>Last heard</th><th></th></tr></thead>
+    <tbody id="sonde-nearby-body"></tbody>
+  </table>
+  </div>
+</section>
+
+</div>
+
 <script>
 const PRESETS = __PRESETS_JSON__;
 const CATEGORIES = __CATEGORIES_JSON__;
@@ -868,6 +988,9 @@ async function refreshStatus() {
       detail.textContent = `pid ${s.pid} · scanning "${s.group}"${antSuffix} · started ${new Date(s.started_at).toLocaleTimeString()}`;
     } else if (s.kind === 'dmr') {
       detail.textContent = `pid ${s.pid} · ${(s.freq_hz/1e6).toFixed(4)} MHz (DMR, via dsd-fme)${antSuffix} · started ${new Date(s.started_at).toLocaleTimeString()}`;
+    } else if (s.kind === 'sonde') {
+      const where = (s.sonde_freqs && s.sonde_freqs.length) ? s.sonde_freqs.map(f => (f/1e6).toFixed(4)).join(', ') + ' MHz' : 'sweeping 400-406 MHz';
+      detail.textContent = `pid ${s.pid} · radiosondes, ${where} (${s.sonde_type || 'auto'})${antSuffix} · started ${new Date(s.started_at).toLocaleTimeString()}`;
     } else if (s.kind === 'spectrum') {
       const range = (s.start_mhz != null ? s.start_mhz : '26') + '-' + (s.end_mhz != null ? s.end_mhz : '470');
       let mode = s.record ? 'survey+record' : 'survey';
@@ -892,6 +1015,16 @@ async function refreshStatus() {
     : (s.running ? `SDR is busy with "${s.kind}" -- stop it from the ${s.kind === 'dmr' ? 'Radio' : 'other'} tab first` : '');
   document.getElementById('spectrum-tuned-info').style.display = (isTuned && lastSweepParams) ? 'block' : 'none';
   document.getElementById('spectrum-shortwave-id-box').style.display = (isTuned && isShortwaveAm) ? 'block' : 'none';
+
+  const isSonde = s.running && s.kind === 'sonde';
+  const sPill = document.getElementById('sonde-status-pill');
+  sPill.textContent = isSonde ? 'running' : (s.running ? 'busy (other tab)' : 'idle');
+  sPill.className = 'status-pill ' + (isSonde ? 'running' : 'idle');
+  document.getElementById('sonde-start-btn').disabled = s.running;
+  document.getElementById('sonde-stop-btn').disabled = !isSonde;
+  document.getElementById('sonde-status-detail').textContent = isSonde ? detail.textContent
+    : (s.running ? `SDR is busy with "${s.kind}" -- stop it first` : 'not running');
+  sondeRunning = isSonde;
 }
 
 async function identifyShortwave(targetId) {
@@ -929,7 +1062,7 @@ async function refreshLogs() {
   const res = await fetch('/api/logs');
   const lines = await res.json();
   const text = lines.join('\\n');
-  for (const id of ['log', 'spectrum-log']) {
+  for (const id of ['log', 'spectrum-log', 'sonde-log']) {
     const pre = document.getElementById(id);
     const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 10;
     pre.textContent = text;
@@ -1107,6 +1240,7 @@ async function stopRecording() {
 }
 
 function showTab(name) {
+  history.replaceState(null, '', '#' + name);
   document.getElementById('tab-radio').style.display = name === 'radio' ? 'block' : 'none';
   document.getElementById('tab-satellite').style.display = name === 'satellite' ? 'block' : 'none';
   document.getElementById('tab-dmr').style.display = name === 'dmr' ? 'block' : 'none';
@@ -1115,9 +1249,12 @@ function showTab(name) {
   document.getElementById('tab-btn-satellite').className = name === 'satellite' ? 'active' : '';
   document.getElementById('tab-btn-dmr').className = name === 'dmr' ? 'active' : '';
   document.getElementById('tab-btn-spectrum').className = name === 'spectrum' ? 'active' : '';
+  document.getElementById('tab-sonde').style.display = name === 'sonde' ? 'block' : 'none';
+  document.getElementById('tab-btn-sonde').className = name === 'sonde' ? 'active' : '';
   if (name === 'satellite') { refreshPasses(); refreshSchedule(); refreshSatelliteGallery(); }
   if (name === 'dmr') { refreshBrandmeisterStatus(); refreshBrandmeisterCalls(); }
   if (name === 'spectrum') { refreshSpectrumHits(); refreshWaterfall(); }
+  if (name === 'sonde') { initSondeMap(); refreshSondeStatus(); refreshSondeFlights(); refreshSondeNearby(); }
 }
 
 const SPECTRUM_RANGES = __SPECTRUM_RANGES_JSON__;
@@ -1572,6 +1709,226 @@ async function refreshBrandmeisterCalls() {
 document.getElementById('bm-hours').addEventListener('change', refreshBrandmeisterCalls);
 document.getElementById('bm-talkgroup').addEventListener('change', refreshBrandmeisterCalls);
 
+
+// ---------------------------------------------------------------- Sondes tab
+const STATION = __STATION_JSON__;
+let sondeMap = null, sondeTrackLayer = null, sondeNearbyLayer = null;
+let selectedSonde = null, sondeFittedFor = null, sondeRunning = false;
+
+function escHtml(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+function fmtNum(v, digits, unit) {
+  if (v === null || v === undefined || Number.isNaN(v)) return '-';
+  return Number(v).toFixed(digits) + (unit || '');
+}
+function fmtAgo(iso) {
+  if (!iso) return '-';
+  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 90) return s + ' s ago';
+  if (s < 5400) return Math.round(s / 60) + ' min ago';
+  if (s < 172800) return Math.round(s / 3600) + ' h ago';
+  return new Date(iso).toLocaleDateString();
+}
+function fmtClimb(v) {
+  if (v === null || v === undefined) return '-';
+  return (v > 0 ? '+' : '') + Number(v).toFixed(1) + ' m/s';
+}
+
+// Leaflet (map) is fetched from a CDN only when the Sondes tab is first
+// opened, rather than as a blocking <script> in <head> -- on a Pi with no
+// internet that would stall the whole control panel, not just the map.
+let leafletLoading = false;
+function initSondeMap() {
+  if (sondeMap) { setTimeout(() => sondeMap.invalidateSize(), 50); return; }
+  if (typeof L === 'undefined') {
+    if (leafletLoading) return;
+    leafletLoading = true;
+    const css = document.createElement('link');
+    css.rel = 'stylesheet';
+    css.href = 'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css';
+    document.head.appendChild(css);
+    const js = document.createElement('script');
+    js.src = 'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js';
+    js.onload = () => { initSondeMap(); refreshSondeFlights(); refreshSondeNearby(); };
+    js.onerror = () => {
+      document.getElementById('sonde-map').innerHTML = '<p class="hint">Map library could not be loaded (no internet?) -- telemetry tables still work.</p>';
+    };
+    document.head.appendChild(js);
+    return;
+  }
+  sondeMap = L.map('sonde-map').setView(STATION, 7);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18, attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(sondeMap);
+  L.circleMarker(STATION, { radius: 6, color: '#2563eb', fillColor: '#2563eb', fillOpacity: 1 })
+    .addTo(sondeMap).bindTooltip('Station');
+  sondeTrackLayer = L.layerGroup().addTo(sondeMap);
+  sondeNearbyLayer = L.layerGroup().addTo(sondeMap);
+}
+
+async function startSonde(freqMhzOverride) {
+  let freqs = [];
+  if (freqMhzOverride !== undefined) {
+    freqs = [freqMhzOverride * 1e6];
+  } else if (document.getElementById('sonde-mode').value === 'freq') {
+    freqs = document.getElementById('sonde-freq').value.split(',').map(x => x.trim()).filter(x => x).map(x => parseFloat(x) * 1e6);
+    if (!freqs.length || freqs.some(f => Number.isNaN(f))) { alert('Enter a frequency in MHz, e.g. 402.700'); return; }
+  }
+  const gainVal = document.getElementById('sonde-gain').value;
+  const body = {
+    kind: 'sonde', freqs_hz: freqs,
+    sonde_type: freqMhzOverride !== undefined ? 'auto' : document.getElementById('sonde-type').value,
+    gain: gainVal === '' ? null : parseFloat(gainVal),
+    antenna: document.getElementById('sonde-antenna').value || null,
+  };
+  const res = await fetch('/api/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok) alert((await res.json()).error);
+  refreshStatus();
+}
+
+async function refreshSondeStatus() {
+  const res = await fetch('/api/sonde/status');
+  const data = await res.json();
+  const body = document.getElementById('sonde-channels-body');
+  const summary = document.getElementById('sonde-receiver-summary');
+  const st = data.status;
+  body.innerHTML = '';
+  if (!data.running || !st) {
+    summary.textContent = '';
+    body.innerHTML = '<tr><td colspan="7" class="hint">Receiver not running.</td></tr>';
+    return;
+  }
+  let text = st.mode === 'sweeping' ? 'Sweeping the band for sondes...' : (st.lo_hz ? `Parked at ${(st.lo_hz / 1e6).toFixed(3)} MHz.` : '');
+  if (st.last_sweep) {
+    const c = st.last_sweep.candidates;
+    text += ` Last sweep ${fmtAgo(st.last_sweep.at)}: ` + (c.length ? c.map(x => `${(x.freq_hz / 1e6).toFixed(4)} MHz (${x.snr_db} dB)`).join(', ') : 'no signals');
+  }
+  if (st.ignored && st.ignored.length) text += ` · skipping non-sonde signals at ${st.ignored.map(f => (f / 1e6).toFixed(4)).join(', ')} MHz`;
+  summary.textContent = text;
+  if (!st.channels.length) {
+    body.innerHTML = '<tr><td colspan="7" class="hint">No channels open.</td></tr>';
+    return;
+  }
+  for (const ch of st.channels) {
+    const lf = ch.last_frame;
+    const lfText = lf ? `${fmtNum(lf.alt, 0, ' m')}, ${fmtClimb(lf.vel_v)}` + (lf.temp != null ? `, ${fmtNum(lf.temp, 1, ' °C')}` : '') + ` · ${fmtAgo(ch.last_frame_at)}` : '-';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${(ch.freq_hz / 1e6).toFixed(4)} MHz</td><td>${escHtml(ch.state)}</td><td>${escHtml(ch.type || ch.detected_as || '-')}</td>`
+      + `<td>${escHtml(ch.serial || '-')}</td><td>${fmtNum(ch.snr_db, 1, ' dB')}</td><td>${ch.frames}</td><td>${escHtml(lfText)}</td>`;
+    body.appendChild(tr);
+  }
+}
+
+async function refreshSondeFlights() {
+  const res = await fetch('/api/sonde/flights');
+  const flights = await res.json();
+  const body = document.getElementById('sonde-flights-body');
+  body.innerHTML = '';
+  if (!flights.length) {
+    body.innerHTML = '<tr><td colspan="11" class="hint">No sondes received yet.</td></tr>';
+    return;
+  }
+  if (!selectedSonde) selectedSonde = flights[0].serial;
+  for (const f of flights) {
+    const l = f.last;
+    const range = l.distance_km != null ? `${fmtNum(l.distance_km, 0, ' km')} @ ${fmtNum(l.azimuth_deg, 0, '°')}, el ${fmtNum(l.elevation_deg, 1, '°')}` : '-';
+    const tr = document.createElement('tr');
+    if (f.serial === selectedSonde) tr.className = 'selected';
+    tr.innerHTML = `<td>${escHtml(f.serial)}${f.burst ? ' <span class="hint">(burst)</span>' : ''}</td><td>${escHtml(f.subtype || f.type || '-')}</td>`
+      + `<td>${fmtNum(f.freq_mhz, 3, ' MHz')}</td><td>${fmtAgo(f.last_rx)}</td><td>${fmtNum(l.alt, 0, ' m')}</td><td>${fmtClimb(l.vel_v)}</td>`
+      + `<td>${fmtNum(l.temp, 1, ' °C')}</td><td>${fmtNum(l.humidity, 0, '%')}</td><td>${range}</td><td>${f.frames}</td>`
+      + `<td><a href="/api/sonde/download?serial=${encodeURIComponent(f.serial)}" onclick="event.stopPropagation()">JSONL</a>`
+      + ` <a href="https://sondehub.org/${encodeURIComponent(f.serial)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">SondeHub</a></td>`;
+    tr.onclick = () => { selectedSonde = f.serial; sondeFittedFor = null; refreshSondeFlights(); };
+    body.appendChild(tr);
+  }
+  const sel = flights.find(f => f.serial === selectedSonde);
+  if (sel) refreshSondeTrack(sel);
+}
+
+function renderSondeStats(f) {
+  const l = f.last;
+  const items = [
+    ['Altitude', fmtNum(l.alt, 0, ' m')], ['Climb', fmtClimb(l.vel_v)], ['Max altitude', fmtNum(f.max_alt, 0, ' m')],
+    ['Temperature', fmtNum(l.temp, 1, ' °C')], ['Humidity', fmtNum(l.humidity, 0, ' %')], ['Pressure', fmtNum(l.pressure, 1, ' hPa')],
+    ['Ground speed', l.vel_h != null ? fmtNum(l.vel_h * 3.6, 0, ' km/h') : '-'], ['Heading', fmtNum(l.heading, 0, '°')],
+    ['Range', fmtNum(l.distance_km, 1, ' km')], ['Azimuth / elev.', l.azimuth_deg != null ? `${fmtNum(l.azimuth_deg, 0, '°')} / ${fmtNum(l.elevation_deg, 1, '°')}` : '-'],
+    ['Battery', fmtNum(l.batt, 2, ' V')], ['GPS sats', l.sats != null ? l.sats : '-'], ['SNR', fmtNum(l.snr_db, 1, ' dB')],
+    ['Last heard', fmtAgo(f.last_rx)],
+  ];
+  document.getElementById('sonde-stats').innerHTML = items.map(([k, v]) => `<div><div class="k">${k}</div><div class="v">${escHtml(v)}</div></div>`).join('');
+}
+
+function renderSondeProfile(track) {
+  const svg = document.getElementById('sonde-profile');
+  const caption = document.getElementById('sonde-profile-caption');
+  const pts = track.filter(p => p.alt != null && p.rx_time);
+  if (pts.length < 2) { svg.innerHTML = ''; caption.textContent = ''; return; }
+  const t0 = new Date(pts[0].rx_time).getTime(), t1 = new Date(pts[pts.length - 1].rx_time).getTime();
+  const maxAlt = Math.max(...pts.map(p => p.alt)), minAlt = Math.min(0, ...pts.map(p => p.alt));
+  const W = 600, H = 170, pad = 4;
+  const x = t => pad + (W - 2 * pad) * ((t - t0) / Math.max(1, t1 - t0));
+  const y = a => H - pad - (H - 2 * pad) * ((a - minAlt) / Math.max(1, maxAlt - minAlt));
+  const line = pts.map(p => `${x(new Date(p.rx_time).getTime()).toFixed(1)},${y(p.alt).toFixed(1)}`).join(' ');
+  const grid = [0.25, 0.5, 0.75].map(fr => `<line x1="0" x2="${W}" y1="${y(minAlt + fr * (maxAlt - minAlt))}" y2="${y(minAlt + fr * (maxAlt - minAlt))}" stroke="#8883" stroke-width="1"/>`).join('');
+  svg.innerHTML = grid + `<polyline points="${line}" fill="none" stroke="#2563eb" stroke-width="2" vector-effect="non-scaling-stroke"/>`;
+  caption.textContent = `Altitude over time: ${new Date(t0).toLocaleTimeString()} - ${new Date(t1).toLocaleTimeString()}, peak ${Math.round(maxAlt)} m (grid lines at quarters of the peak).`;
+}
+
+async function refreshSondeTrack(f) {
+  document.getElementById('sonde-selected-title').textContent = `${f.serial} (${f.subtype || f.type || 'sonde'})`;
+  renderSondeStats(f);
+  const res = await fetch('/api/sonde/track?serial=' + encodeURIComponent(f.serial));
+  if (!res.ok) return;
+  const track = await res.json();
+  renderSondeProfile(track);
+  if (!sondeMap) return;
+  sondeTrackLayer.clearLayers();
+  if (!track.length) return;
+  const latlngs = track.map(p => [p.lat, p.lon]);
+  L.polyline(latlngs, { color: '#dc2626', weight: 3 }).addTo(sondeTrackLayer);
+  L.circleMarker(latlngs[0], { radius: 4, color: '#16a34a', fillOpacity: 1 }).addTo(sondeTrackLayer).bindTooltip('First heard');
+  const last = track[track.length - 1];
+  L.circleMarker(latlngs[latlngs.length - 1], { radius: 7, color: '#dc2626', fillColor: '#dc2626', fillOpacity: 1 })
+    .addTo(sondeTrackLayer)
+    .bindTooltip(`${escHtml(f.serial)}: ${fmtNum(last.alt, 0, ' m')}, ${fmtClimb(last.vel_v)}`, { permanent: true, direction: 'right' });
+  if (sondeFittedFor !== f.serial) {
+    sondeMap.fitBounds(L.latLngBounds(latlngs.concat([STATION])).pad(0.2));
+    sondeFittedFor = f.serial;
+  }
+}
+
+async function refreshSondeNearby() {
+  const res = await fetch('/api/sonde/nearby');
+  const data = await res.json();
+  const body = document.getElementById('sonde-nearby-body');
+  const hint = document.getElementById('sonde-nearby-hint');
+  body.innerHTML = '';
+  if (data.error) hint.textContent = data.error;
+  const sondes = data.sondes || [];
+  if (!sondes.length) body.innerHTML = '<tr><td colspan="8" class="hint">Nothing airborne within range right now.</td></tr>';
+  for (const s of sondes) {
+    const tr = document.createElement('tr');
+    const canDecode = s.freq_mhz && s.freq_mhz >= 400 && s.freq_mhz <= 406;
+    tr.innerHTML = `<td><a href="${escHtml(s.tracker_url)}" target="_blank" rel="noopener">${escHtml(s.serial)}</a></td><td>${escHtml(s.subtype || s.type || '-')}</td>`
+      + `<td>${fmtNum(s.freq_mhz, 3, ' MHz')}</td><td>${fmtNum(s.alt, 0, ' m')}</td><td>${fmtClimb(s.vel_v)}</td>`
+      + `<td>${fmtNum(s.distance_km, 0, ' km')}</td><td>${fmtAgo(s.last_heard)}</td>`
+      + `<td>${canDecode ? `<button style="font-size:0.8rem" ${sondeRunning ? 'disabled' : ''} onclick="startSonde(${Number(s.freq_mhz)})">Decode</button>` : ''}</td>`;
+    body.appendChild(tr);
+  }
+  if (!sondeMap) return;
+  sondeNearbyLayer.clearLayers();
+  if (!document.getElementById('sonde-show-nearby').checked) return;
+  for (const s of sondes) {
+    L.circleMarker([s.lat, s.lon], { radius: 5, color: '#888', fillColor: '#888', fillOpacity: 0.7 })
+      .addTo(sondeNearbyLayer)
+      .bindTooltip(`${escHtml(s.serial)} ${fmtNum(s.freq_mhz, 3, ' MHz')}, ${fmtNum(s.alt, 0, ' m')} (${fmtAgo(s.last_heard)}, SondeHub)`);
+  }
+}
+
+// Open a tab straight from the URL, e.g. http://pi:8080/#sonde
+if (['radio', 'satellite', 'dmr', 'spectrum', 'sonde'].includes(location.hash.slice(1))) showTab(location.hash.slice(1));
 refreshStatus(); refreshLogs(); refreshFiles(); refreshAudioSinks();
 setInterval(refreshStatus, 2000);
 setInterval(refreshLogs, 2000);
@@ -1580,6 +1937,8 @@ setInterval(() => { if (document.getElementById('tab-satellite').style.display !
 setInterval(() => { if (document.getElementById('tab-dmr').style.display !== 'none') { refreshBrandmeisterStatus(); refreshBrandmeisterCalls(); } }, 15000);
 setInterval(() => { if (document.getElementById('tab-spectrum').style.display !== 'none') { refreshSpectrumHits(); } }, 5000);
 setInterval(() => { if (document.getElementById('tab-spectrum').style.display !== 'none') { refreshWaterfall(); } }, 600);
+setInterval(() => { if (document.getElementById('tab-sonde').style.display !== 'none') { refreshSondeStatus(); refreshSondeFlights(); } }, 3000);
+setInterval(() => { if (document.getElementById('tab-sonde').style.display !== 'none') { refreshSondeNearby(); } }, 60000);
 </script>
 </body>
 </html>
@@ -1624,7 +1983,8 @@ def render_index() -> bytes:
             .replace("__CATEGORIES_JSON__", categories_json)
             .replace("__DMR_REPEATER_OPTIONS__", dmr_repeater_options)
             .replace("__SPECTRUM_RANGE_OPTIONS__", spectrum_range_options)
-            .replace("__SPECTRUM_RANGES_JSON__", spectrum_ranges_json))
+            .replace("__SPECTRUM_RANGES_JSON__", spectrum_ranges_json)
+            .replace("__STATION_JSON__", json.dumps([flight_lookup.EBAW_LAT, flight_lookup.EBAW_LON])))
     return html.encode("utf-8")
 
 
@@ -1755,6 +2115,34 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(list_spectrum_hits())
         elif parsed.path == "/api/spectrum/waterfall":
             self._send_json(read_spectrum_waterfall())
+        elif parsed.path == "/api/sonde/status":
+            st = recorder.status()
+            running = st["running"] and st["kind"] == "sonde"
+            self._send_json({"running": running, "status": sonde_data.read_status() if running else None})
+        elif parsed.path == "/api/sonde/flights":
+            self._send_json(sonde_data.list_flights())
+        elif parsed.path == "/api/sonde/track":
+            serial = parse_qs(parsed.query).get("serial", [""])[0]
+            track = sonde_data.read_track(serial)
+            if track is None:
+                self._send_json({"error": "unknown flight"}, 404)
+            else:
+                self._send_json(track)
+        elif parsed.path == "/api/sonde/nearby":
+            self._send_json(sonde_data.fetch_nearby())
+        elif parsed.path == "/api/sonde/download":
+            serial = parse_qs(parsed.query).get("serial", [""])[0]
+            path = sonde_data.flight_path(serial)
+            if path is None:
+                self._send_json({"error": "unknown flight"}, 404)
+                return
+            body = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -1882,6 +2270,17 @@ class Handler(BaseHTTPRequestHandler):
                         float(end_mhz) if end_mhz not in (None, "") else None,
                         gain, record=bool(body.get("record", False)),
                         voice_check=bool(body.get("voice_check", True)), antenna=antenna)
+                elif kind == "sonde":
+                    freqs = [float(f) for f in (body.get("freqs_hz") or [])]
+                    for f in freqs:
+                        if not 400e6 <= f <= 406e6:
+                            raise ValueError(f"{f / 1e6:.4f} MHz is outside the 400-406 MHz sonde band")
+                    if freqs and max(freqs) - min(freqs) > 1.35e6:
+                        raise ValueError("frequencies must all be within 1.35 MHz of each other")
+                    sonde_type = str(body.get("sonde_type") or "auto")
+                    if sonde_type not in ("auto", "RS41", "DFM", "M10", "IMET4"):
+                        raise ValueError(f"invalid sonde type: {sonde_type}")
+                    recorder.start_sonde(freqs, sonde_type, gain, antenna)
                 else:
                     raise ValueError(f"invalid kind: {kind}")
                 self._send_json({"ok": True})
@@ -1932,6 +2331,7 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     SATELLITE_DIR.mkdir(parents=True, exist_ok=True)
     BRANDMEISTER_DIR.mkdir(parents=True, exist_ok=True)
+    SONDE_DIR.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=satellite_scheduler.run_forever, daemon=True).start()
     threading.Thread(target=brandmeister_monitor.run_forever, daemon=True).start()
     httpd = Server((args.host, args.port), Handler)
