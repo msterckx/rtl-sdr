@@ -41,6 +41,7 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -48,7 +49,8 @@ import numpy as np
 from scipy.signal import butter, lfilter, medfilt
 from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
 
-from record import AUDIO_RATE, CHUNK_SECONDS, DcBlocker, FmDiscriminator, open_sdr, write_wav
+from record import (AUDIO_RATE, CHUNK_SECONDS, DEFAULT_WHISPER_BIN, DEFAULT_WHISPER_MODEL,
+                    DcBlocker, FmDiscriminator, open_sdr, transcribe_file, write_wav)
 
 DEFAULT_START_MHZ = 26.0
 DEFAULT_END_MHZ = 470.0
@@ -218,6 +220,13 @@ class WaterfallWriter:
         self._last_write = 0.0
 
     def update(self, freqs: np.ndarray, power: np.ndarray) -> None:
+        # Drop capture bins outside the survey range rather than clipping them
+        # into the edge columns -- a capture is often much wider than a narrow
+        # range, and clipping would paint its whole average into those columns.
+        inside = (freqs >= self.start_hz) & (freqs < self.end_hz)
+        if not inside.any():
+            return
+        freqs, power = freqs[inside], power[inside]
         power_db = 10 * np.log10(np.maximum(power, 1e-12))
         idx = np.clip(np.searchsorted(self.bin_edges, freqs, side="right") - 1,
                        0, self.n_bins - 1)
@@ -249,14 +258,58 @@ class WaterfallWriter:
             print(f"waterfall write failed: {exc}", file=sys.stderr)
 
 
+# How far a narrow range is kept off the LO when it fits in one step -- well
+# clear of DC_GUARD_BINS (~8 kHz at the default step/FFT size) so no channel
+# in the range lands on the blanked center bins.
+NARROW_RANGE_DC_OFFSET_HZ = 50_000.0
+
+
+# A range this narrow (PMR446 is 200 kHz) is captured the way record.py
+# captures a single channel -- 2 MS/s behind a narrow IF filter -- instead of
+# the full 8 MHz step. The wide step lets every strong signal within +-4 MHz
+# into the ADC, and measured at 446 MHz with gain 20 that pinned the samples
+# at full scale continuously, burying a nearby PMR handheld to 10-16 dB over
+# the (overload-raised) floor; the 600 kHz filter keeps all of that out.
+NARROW_SAMPLE_RATE_HZ = 2_000_000.0
+NARROW_IF_BANDWIDTH_HZ = 600_000.0  # an SDRplay IF filter width, see --step-mhz
+
+
+def capture_geometry(start_hz: float, end_hz: float, step_hz: float, overlap: float,
+                     fft_size: int) -> tuple[float, float, int]:
+    """(sample_rate_hz, if_bandwidth_hz, fft_size) for this sweep. Normally
+    the sample rate and IF filter are both step_hz; a range that fits in one
+    narrow capture (see build_steps' single-step case) gets the narrow
+    capture instead, with fft_size scaled down so the FFT bin width -- and
+    so every bandwidth/window setting expressed in Hz -- stays the same."""
+    span = end_hz - start_hz
+    if (step_hz > NARROW_IF_BANDWIDTH_HZ
+            and span <= NARROW_IF_BANDWIDTH_HZ * overlap / 2 - NARROW_RANGE_DC_OFFSET_HZ):
+        scaled_fft = max(256, int(round(fft_size * NARROW_SAMPLE_RATE_HZ / step_hz)))
+        return NARROW_SAMPLE_RATE_HZ, NARROW_IF_BANDWIDTH_HZ, scaled_fft
+    return step_hz, step_hz, fft_size
+
+
 def build_steps(start_hz: float, end_hz: float, step_hz: float, overlap: float) -> list[float]:
+    """Step centers covering start_hz..end_hz using only the middle `overlap`
+    fraction of each capture. The outer edges of a capture sit in the IF
+    filter's roll-off, where a real signal still paints the waterfall but is
+    attenuated too far to clear the detection threshold -- so the requested
+    range has to be kept inside the usable middle, not flush against the
+    capture's edge (which is what put a 446.0-446.2 MHz PMR sweep in the
+    bottom 200 kHz of a 446-454 MHz capture, where nothing was ever detected).
+
+    A range that fits in half the usable width gets a single step whose LO
+    sits just below it, so the whole range is on one side of DC instead of
+    straddling the DC-guard bins (PMR446 CH8 is only 6.25 kHz off 446.1 MHz)."""
     advance = step_hz * overlap
-    steps = []
-    center = start_hz + step_hz / 2
-    while center - step_hz / 2 < end_hz:
-        steps.append(center)
-        center += advance
-    return steps
+    span = end_hz - start_hz
+    if span <= 0:
+        return []
+    if span <= advance / 2 - NARROW_RANGE_DC_OFFSET_HZ:
+        return [start_hz - NARROW_RANGE_DC_OFFSET_HZ]
+    n = int(np.ceil(span / advance))
+    first = (start_hz + end_hz) / 2 - (n - 1) * advance / 2
+    return [first + k * advance for k in range(n)]
 
 
 def power_spectrum(iq: np.ndarray, fft_size: int) -> np.ndarray | None:
@@ -305,6 +358,29 @@ def spectral_floor(power: np.ndarray, kernel_bins: int) -> np.ndarray:
     return medfilt(power, kernel_size=kernel_bins)
 
 
+STRONG_CORE_DB = 20.0
+
+
+def strong_signal_core(power, lo, hi):
+    """(lo, hi) of the bins within STRONG_CORE_DB of the run's peak, contiguous
+    around it. A transmitter close to the antenna (a PMR handheld in the same
+    room, measured at ~71 dB over the floor) lifts its spectral skirts over
+    the threshold across ~140 kHz, which alone would fail the max-width check
+    as if it were broadband noise; its core is still one narrow channel
+    (~6 kHz). A genuinely flat broadband burst has no such core -- its
+    near-peak region stays wide and it's still rejected."""
+    seg = power[lo:hi]
+    k = int(np.argmax(seg))
+    strong = seg > seg[k] / 10 ** (STRONG_CORE_DB / 10)
+    a = k
+    while a > 0 and strong[a - 1]:
+        a -= 1
+    b = k + 1
+    while b < len(seg) and strong[b]:
+        b += 1
+    return lo + a, lo + b
+
+
 def detect_hits(power, noise_floor_bins, freqs, bin_hz, open_ratio, min_bins, max_bins, dc_guard,
                  spectral_window_bins=None):
     """Compare one power spectrum against its per-bin noise floor AND its
@@ -334,7 +410,11 @@ def detect_hits(power, noise_floor_bins, freqs, bin_hz, open_ratio, min_bins, ma
         active = active | (power > floor_bins * open_ratio)
     hits = []
     for lo, hi in contiguous_runs(active):
-        if not (min_bins <= hi - lo <= max_bins):
+        if hi - lo > max_bins:
+            lo, hi = strong_signal_core(power, lo, hi)
+            if hi - lo > max_bins:
+                continue
+        elif hi - lo < min_bins:
             continue
         seg_power = power[lo:hi]
         seg_freqs = freqs[lo:hi]
@@ -409,6 +489,45 @@ def envelope_modulation_db(audio: np.ndarray, audio_rate: int, win_s: float = 0.
     return float(20 * np.log10((core.max() + eps) / (core.min() + eps)))
 
 
+CARRIER_GATE_DB = 20.0
+KEYUP_GUARD_S = 0.05
+
+
+def trim_to_carrier(audio: np.ndarray, power: np.ndarray) -> tuple[np.ndarray, int]:
+    """Trim the clip's leading/trailing audio where the channel's carrier
+    power is more than CARRIER_GATE_DB below the transmission's own level
+    (its 90th percentile), returning (trimmed_audio, samples_cut_from_head).
+
+    With the carrier gone an FM discriminator outputs full-scale noise, while
+    a clean FM voice signal demodulates quietly: on a PMR446 test clip the
+    1s hang-time tail sat at -10 dBFS against speech at -56 dBFS, so the
+    peak-normalized WAV was essentially all noise ("*explosion*" from
+    whisper, flatness 0.58) -- trimmed, the same audio transcribed correctly
+    with flatness 0.08. A weak signal whose carrier never clears the gate
+    over the noise just isn't trimmed, same as before."""
+    if len(power) != len(audio) or len(audio) == 0:
+        return audio, 0
+    on = np.flatnonzero(power >= np.percentile(power, 90) / 10 ** (CARRIER_GATE_DB / 10))
+    if len(on) == 0:
+        return audio, 0
+    # Also drop the transmitter's key-up click right after the carrier
+    # appears -- on the PMR446 test clip its first 50 ms was ~20 dB louder
+    # than the speech, so peak normalization buried the speech under it.
+    start = on[0] + int(KEYUP_GUARD_S * AUDIO_RATE) if on[0] > 0 else 0
+    start = min(start, on[-1])
+    return audio[start:on[-1] + 1], int(start)
+
+
+def highpass_voice(audio: np.ndarray, audio_rate: int, cutoff_hz: float = VOICE_BAND_HZ[0]) -> np.ndarray:
+    """Remove sub-voice-band content before envelope_modulation_db(): FM PMR
+    and business radios send a continuous CTCSS sub-tone (67-254 Hz, 79.7 Hz
+    on the PMR446 test radio) under the speech, which holds the envelope up
+    through every pause and read 10.6 dB on real speech -- 24.9 dB once
+    filtered, against the 15 dB threshold."""
+    b, a = butter(4, cutoff_hz / (audio_rate / 2), btype="high")
+    return lfilter(b, a, audio).astype(np.float32)
+
+
 class ChannelDemod:
     """Extracts one narrowband channel's audio from successive wideband IQ
     chunks: mixes it to baseband with a phase-continuous NCO (so there's no
@@ -430,19 +549,28 @@ class ChannelDemod:
         self.fm_disc = FmDiscriminator() if mode == "fm" else None
         self._phase = 0.0
 
-    def process(self, iq: np.ndarray) -> np.ndarray:
+    def process(self, iq: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(audio, carrier_power): carrier_power is one value per audio
+        sample -- |mean baseband|^2 over that sample's decimation block,
+        i.e. power in a ~AUDIO_RATE-wide slot around the channel -- so
+        finalize_channel() can tell carrier-on audio from the FM
+        discriminator's loud carrier-off noise, sample-accurately."""
         n = len(iq)
         t = np.arange(n) / self.sample_rate
         mixer = np.exp(-1j * (2 * np.pi * self.offset_hz * t + self._phase)).astype(np.complex64)
         self._phase = (self._phase + 2 * np.pi * self.offset_hz * n / self.sample_rate) % (2 * np.pi)
         baseband = iq * mixer
+        n_out = -(-n // self.decimation)
+        padded = np.zeros(n_out * self.decimation, np.complex64)
+        padded[:n] = baseband
+        power = (np.abs(padded.reshape(n_out, self.decimation).mean(axis=1)) ** 2).astype(np.float32)
         if self.mode == "am":
             envelope = np.abs(baseband).astype(np.float64)
             filtered, self.lp_zi = lfilter(self.lp_b, self.lp_a, envelope, zi=self.lp_zi)
-            return self.dc_blocker.apply(filtered[::self.decimation].astype(np.float32))
+            return self.dc_blocker.apply(filtered[::self.decimation].astype(np.float32)), power
         demod = self.fm_disc.apply(baseband).astype(np.float64)
         filtered, self.lp_zi = lfilter(self.lp_b, self.lp_a, demod, zi=self.lp_zi)
-        return filtered[::self.decimation].astype(np.float32)
+        return filtered[::self.decimation].astype(np.float32), power
 
 
 class PendingHit:
@@ -456,23 +584,29 @@ class PendingHit:
 
 
 class TrackedChannel:
-    __slots__ = ("freq_hz", "mode", "demod", "buffer", "close_counter", "opened_at")
+    __slots__ = ("freq_hz", "mode", "demod", "buffer", "power", "close_counter", "opened_at",
+                 "preroll_ms")
 
     def __init__(self, freq_hz: float, mode: str, demod: ChannelDemod, opened_at: datetime):
         self.freq_hz = freq_hz
         self.mode = mode
         self.demod = demod
         self.buffer: list[np.ndarray] = []
+        self.power: list[np.ndarray] = []
         self.close_counter = 0
         self.opened_at = opened_at
+        self.preroll_ms = 0.0
 
 
 def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
            open_ratio, relog_interval, out_path, min_bandwidth_hz, max_bandwidth_hz,
            record_audio=False, out_dir=None, hang_time=1.0, min_duration=0.4, pre_roll=0.3,
            voice_check=True, flatness_threshold=0.3, min_modulation_db=15.0, open_chunks=2,
-           waterfall_out=None, antenna=None, spectral_window_hz=DEFAULT_SPECTRAL_WINDOW_HZ):
-    steps = build_steps(start_hz, end_hz, step_hz, overlap)
+           waterfall_out=None, antenna=None, spectral_window_hz=DEFAULT_SPECTRAL_WINDOW_HZ,
+           transcribe=True, whisper_bin=DEFAULT_WHISPER_BIN, whisper_model=DEFAULT_WHISPER_MODEL,
+           whisper_threads=4):
+    sample_rate, if_bw_hz, fft_size = capture_geometry(start_hz, end_hz, step_hz, overlap, fft_size)
+    steps = build_steps(start_hz, end_hz, if_bw_hz, overlap)
     if not steps:
         raise ValueError("empty sweep range")
 
@@ -484,14 +618,23 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
     if record_audio:
         out_dir = Path(out_dir) if out_dir else out_path.parent
         out_dir.mkdir(parents=True, exist_ok=True)
+    # Same rule as record.py: whisper runs on a worker thread, never inline in
+    # the sweep loop, or a multi-second transcription would stall readStream().
+    executor = None
+    if record_audio and transcribe:
+        if Path(whisper_bin).exists() and Path(whisper_model).exists():
+            executor = ThreadPoolExecutor(max_workers=1)
+        else:
+            print(f"Transcription disabled: whisper-cli or model not found "
+                  f"({whisper_bin}, {whisper_model})", file=sys.stderr)
 
-    sdr = open_sdr(gain_db, sample_rate=step_hz, bandwidth_hz=step_hz, antenna=antenna)
+    sdr = open_sdr(gain_db, sample_rate=sample_rate, bandwidth_hz=if_bw_hz, antenna=antenna)
     rx = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
     sdr.activateStream(rx)
 
-    dwell_samples = max(fft_size, int(step_hz * dwell))
-    chunk_samples = max(fft_size, int(step_hz * CHUNK_SECONDS))
-    bin_hz = step_hz / fft_size
+    dwell_samples = max(fft_size, int(sample_rate * dwell))
+    chunk_samples = max(fft_size, int(sample_rate * CHUNK_SECONDS))
+    bin_hz = sample_rate / fft_size
     dc_guard = slice(fft_size // 2 - DC_GUARD_BINS, fft_size // 2 + DC_GUARD_BINS + 1)
     noise_floor = [np.full(fft_size, 1e-9, dtype=np.float64) for _ in steps]
     hang_chunks = max(1, int(round(hang_time / CHUNK_SECONDS)))
@@ -515,7 +658,7 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
 
     mode_word = "survey+record" if record_audio else "survey"
     print(f"Sweeping {start_hz / 1e6:.3f}-{end_hz / 1e6:.3f} MHz in {len(steps)} step(s) of "
-          f"{step_hz / 1e6:.2f} MHz ({mode_word}) -- Ctrl+C to stop", file=sys.stderr)
+          f"{if_bw_hz / 1e6:.2f} MHz ({mode_word}) -- Ctrl+C to stop", file=sys.stderr)
     print(f"Logging hits to {out_path}", file=sys.stderr)
     if record_audio:
         print(f"Writing recordings to {out_dir}/", file=sys.stderr)
@@ -531,6 +674,11 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
     n_hits = 0
     n_recordings = 0
     n_discarded = 0
+
+    def in_range(hits):
+        """A capture is wider than a narrow requested range (8 MHz around a
+        200 kHz PMR sweep) -- only act on hits inside what was asked for."""
+        return [h for h in hits if start_hz <= h[0] <= end_hz]
 
     def log_new_hit(centroid, bandwidth, peak, local_floor) -> None:
         nonlocal n_hits
@@ -548,6 +696,8 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
         happened to fire first."""
         nonlocal n_recordings, n_discarded
         audio = np.concatenate(ch.buffer) if ch.buffer else np.empty(0, np.float32)
+        carrier = np.concatenate(ch.power) if ch.power else np.empty(0, np.float32)
+        audio, head_trim = trim_to_carrier(audio, carrier)
         dur_s = len(audio) / AUDIO_RATE
         if len(audio) < min_samples:
             print(f"[{datetime.now():%H:%M:%S}] discarded {ch.freq_hz / 1e6:.4f} MHz clip "
@@ -559,7 +709,8 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
         # written clip still carries what the algorithm *would* have decided,
         # for comparing against your own judgement once you've listened to it.
         flatness = spectral_flatness(audio, AUDIO_RATE)
-        mod_range_db = envelope_modulation_db(audio, AUDIO_RATE)
+        mod_range_db = envelope_modulation_db(
+            highpass_voice(audio, AUDIO_RATE) if ch.mode == "fm" else audio, AUDIO_RATE)
         flat_ok = flatness <= flatness_threshold
         mod_ok = mod_range_db >= min_modulation_db
         would_reject = not (flat_ok and mod_ok)
@@ -587,6 +738,10 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
               f"({dur_s:.1f}s, {ch.freq_hz / 1e6:.4f} MHz {ch.mode.upper()}) -- {metrics}{flag}",
               file=sys.stderr)
         logger.log_recording(ch.freq_hz, ch.mode, dur_s, path.name)
+        if executor is not None:
+            skip_ms = max(0.0, ch.preroll_ms - 1000 * head_trim / AUDIO_RATE)
+            executor.submit(transcribe_file, path, whisper_bin, whisper_model,
+                             whisper_threads, skip_ms)
 
     def seed_step(i: int, center: float) -> None:
         sdr.setFrequency(SOAPY_SDR_RX, 0, center)
@@ -595,9 +750,9 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
         power = power_spectrum(read_n(dwell_samples), fft_size)
         if power is not None:
             noise_floor[i] = power
-            freqs = center - step_hz / 2 + bin_hz * np.arange(fft_size)
+            freqs = center - sample_rate / 2 + bin_hz * np.arange(fft_size)
             waterfall.update(freqs, power)
-            waterfall.maybe_write(center - step_hz / 2, center + step_hz / 2)
+            waterfall.maybe_write(center - if_bw_hz / 2, center + if_bw_hz / 2)
 
     def visit_step_detect_only(i: int, center: float) -> None:
         sdr.setFrequency(SOAPY_SDR_RX, 0, center)
@@ -606,16 +761,16 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
         power = power_spectrum(read_n(dwell_samples), fft_size)
         if power is None:
             return
-        freqs = center - step_hz / 2 + bin_hz * np.arange(fft_size)
+        freqs = center - sample_rate / 2 + bin_hz * np.arange(fft_size)
         hits, active, power = detect_hits(power, noise_floor[i], freqs, bin_hz,
                                            open_ratio, min_bins, max_bins, dc_guard,
                                            spectral_window_bins)
-        for centroid, bandwidth, peak, local_floor in hits:
+        for centroid, bandwidth, peak, local_floor in in_range(hits):
             log_new_hit(centroid, bandwidth, peak, local_floor)
         idle = ~active
         noise_floor[i][idle] = 0.98 * noise_floor[i][idle] + 0.02 * power[idle]
         waterfall.update(freqs, power)
-        waterfall.maybe_write(center - step_hz / 2, center + step_hz / 2)
+        waterfall.maybe_write(center - if_bw_hz / 2, center + if_bw_hz / 2)
 
     def visit_step_record(i: int, center: float) -> None:
         """Keep dwelling on this step -- not moving to the next one -- for as
@@ -635,7 +790,7 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
         sdr.setFrequency(SOAPY_SDR_RX, 0, center)
         reader.flush()
         read_n(fft_size)
-        freqs = center - step_hz / 2 + bin_hz * np.arange(fft_size)
+        freqs = center - sample_rate / 2 + bin_hz * np.arange(fft_size)
         tracked: dict[int, TrackedChannel] = {}
         pending: dict[int, PendingHit] = {}
         history: deque[np.ndarray] = deque(maxlen=preroll_chunks + open_chunks - 1)
@@ -651,7 +806,7 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
 
             matched_ids = set()
             matched_pending = set()
-            for centroid, bandwidth, peak, local_floor in hits:
+            for centroid, bandwidth, peak, local_floor in in_range(hits):
                 match_id = next((cid for cid, ch in tracked.items()
                                   if abs(ch.freq_hz - centroid) <= match_tolerance_hz), None)
                 if match_id is not None:
@@ -676,10 +831,15 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
                 # plus the chunks spent confirming this candidate).
                 del pending[pending_id]
                 mode = guess_mode(centroid)
-                demod = ChannelDemod(centroid - center, mode, step_hz, AUDIO_RATE)
+                demod = ChannelDemod(centroid - center, mode, sample_rate, AUDIO_RATE)
                 ch = TrackedChannel(centroid, mode, demod, datetime.now())
                 for hist_chunk in history:
-                    ch.buffer.append(demod.process(hist_chunk))
+                    audio, carrier = demod.process(hist_chunk)
+                    ch.buffer.append(audio)
+                    ch.power.append(carrier)
+                # Passed to whisper as --offset-t so it skips the pre-roll's
+                # squelch-open transient -- see record.transcribe_file().
+                ch.preroll_ms = 1000 * CHUNK_SECONDS * max(0, len(history) - (open_chunks - 1))
                 match_id = next_id
                 tracked[match_id] = ch
                 next_id += 1
@@ -694,7 +854,9 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
 
             for cid in list(tracked.keys()):
                 ch = tracked[cid]
-                ch.buffer.append(ch.demod.process(iq))
+                audio, carrier = ch.demod.process(iq)
+                ch.buffer.append(audio)
+                ch.power.append(carrier)
                 if cid not in matched_ids:
                     ch.close_counter += 1
                     if ch.close_counter >= hang_chunks:
@@ -705,7 +867,7 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
             idle = ~active
             noise_floor[i][idle] = 0.98 * noise_floor[i][idle] + 0.02 * power[idle]
             waterfall.update(freqs, power)
-            waterfall.maybe_write(center - step_hz / 2, center + step_hz / 2)
+            waterfall.maybe_write(center - if_bw_hz / 2, center + if_bw_hz / 2)
 
             if not tracked and not pending:
                 break
@@ -726,6 +888,9 @@ def survey(start_hz, end_hz, step_hz, fft_size, overlap, dwell, gain_db,
         reader.close()
         sdr.deactivateStream(rx)
         sdr.closeStream(rx)
+        if executor is not None:
+            print("Waiting for pending transcriptions to finish...", file=sys.stderr)
+            executor.shutdown(wait=True)
         summary = f"{n_hits} hit(s) logged"
         if record_audio:
             summary += (f", {n_recordings} recording(s) written to {out_dir}/, "
@@ -758,6 +923,17 @@ def main() -> None:
                          help="manual RF gain in dB, 0-66 (default: 40); pass --gain=-1 for AGC")
     parser.add_argument("--antenna", choices=["A", "B", "C"], default=None,
                          help="RSPdx antenna input to use (default: device default, Antenna A)")
+    parser.add_argument("--transcribe", dest="transcribe", action="store_true", default=True,
+                         help="transcribe each written clip with local whisper.cpp (default: on, "
+                              "only used with --record)")
+    parser.add_argument("--no-transcribe", dest="transcribe", action="store_false",
+                         help="disable transcription")
+    parser.add_argument("--whisper-bin", default=str(DEFAULT_WHISPER_BIN),
+                         help=f"path to whisper-cli binary (default: {DEFAULT_WHISPER_BIN})")
+    parser.add_argument("--whisper-model", default=str(DEFAULT_WHISPER_MODEL),
+                         help=f"path to whisper.cpp ggml model (default: {DEFAULT_WHISPER_MODEL})")
+    parser.add_argument("--whisper-threads", type=int, default=4,
+                         help="threads for whisper.cpp to use per transcription")
     parser.add_argument("--open-ratio", type=float, default=8.0,
                          help="power/noise-floor ratio for a bin to count as active (default: 8.0); "
                               "raise this if a noisy RF environment is triggering on noise variance")
@@ -837,7 +1013,9 @@ def main() -> None:
            min_duration=args.min_duration, pre_roll=args.pre_roll,
            voice_check=args.voice_check, flatness_threshold=args.flatness_threshold,
            min_modulation_db=args.min_modulation_db, spectral_window_hz=args.spectral_window_hz,
-           open_chunks=args.open_chunks, waterfall_out=args.waterfall_out, antenna=args.antenna)
+           open_chunks=args.open_chunks, waterfall_out=args.waterfall_out, antenna=args.antenna,
+           transcribe=args.transcribe, whisper_bin=args.whisper_bin,
+           whisper_model=args.whisper_model, whisper_threads=args.whisper_threads)
 
 
 if __name__ == "__main__":
